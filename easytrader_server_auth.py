@@ -1922,10 +1922,35 @@ def _find_xiadan_pid():
     return None
 
 
+def _xiadan_process_exists():
+    """当前是否仍有 xiadan.exe 进程在跑(单实例保护用)."""
+    try:
+        out = subprocess.run(
+            ["tasklist", "/fi", "IMAGENAME eq xiadan.exe", "/fo", "csv", "/nh"],
+            capture_output=True, text=True,
+        ).stdout
+        return "xiadan.exe" in out
+    except Exception:
+        return False
+
+
+def _wait_for_xiadan_exit(timeout):
+    """等所有残留 xiadan.exe 进程退出(刚被杀死可能尚未完全释放单实例锁). 返回 True=已无进程."""
+    deadline = _t.time() + timeout
+    while _t.time() < deadline:
+        if not _xiadan_process_exists():
+            return True
+        _t.sleep(0.3)
+    return not _xiadan_process_exists()
+
+
 def _launch_xiadan():
     """启动 xiadan.exe (账号已保存, 会自动登录). 返回新进程 PID.
     仅在桌面上确无 xiadan 窗口时才调用(避免单实例冲突).
+    启动前先等残留 xiadan.exe 完全退出: 否则新实例会因单实例锁冲突而立即退出
+    (表现为"拉起一下又消失"), 尤其"杀进程后立刻请求"的极端时序.
     启动后若开启 client_hide_console, 隐藏其控制台黑框(保留 GUI 交易窗口)."""
+    _wait_for_xiadan_exit(5.0)
     before = _snapshot_console_hwnds()
     proc = subprocess.Popen([EXE_PATH])
     print(f"[info] 已启动 xiadan.exe pid={proc.pid} ({EXE_PATH})")
