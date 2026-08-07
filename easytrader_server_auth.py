@@ -1298,7 +1298,7 @@ def load_config():
         "verbose_log": True,    # 常规运行日志([info]/[warn]/[dbg] 等); 不开发时设 false 关闭, 降低 I/O 消耗
         "wait_multiplier": 1.0, # 等待速度倍率: =1 原速; >1 更慢更稳(老/卡机); <1 更快(快机). 所有行为/稳健性等待都乘以此值
         "captcha_max_attempts": 20, # 验证码 OCR 解卡最大尝试次数; 同花顺输错会刷新新码, 多试几次提高认对概率(用户要求>=10~20)
-        "client_guardian": true, # 客户端守护: 自动看护同花顺 xiadan.exe(崩溃自愈+开机自启). 环境变量 EASYTRADER_CLIENT_GUARDIAN 可关
+        "client_guardian": True, # 客户端守护: 自动看护同花顺 xiadan.exe(崩溃自愈+开机自启). 环境变量 EASYTRADER_CLIENT_GUARDIAN 可关
         "client_relaunch_cooldown": 30, # 两次自动拉起最小间隔(秒), 防抖动
         "client_startup_timeout": 60, # 启动 xiadan 后等待主窗口"股票交易"出现的最长超时(秒)
         "client_max_auto_retries": 5, # 连续自动拉起失败达此数则停止自动拉起(置 broken, 需手动 POST /xiadan/start)
@@ -1664,20 +1664,58 @@ def _refresh_user_window(user):
 # 复用既有函数, 不重写任何验证码检测/填入代码.
 
 def _pid_alive(pid):
-    """进程是否存活(Windows 下 os.kill(pid,0) 探测)."""
+    """进程是否存活(Windows).
+    注意: 本机 os.kill(pid,0) 会抛 WinError 87(参数错误), 不能用作存在探测;
+    改用 OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION=0x1000) 探测, tasklist 兜底."""
     try:
-        os.kill(pid, 0)
-        return True
-    except ProcessLookupError:
+        pid = int(pid)
+    except Exception:
         return False
-    except PermissionError:
-        return True  # 进程存在但无权限信号, 仍算存活
+    try:
+        h = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)
+        if h:
+            ctypes.windll.kernel32.CloseHandle(h)
+            return True
+        return False
+    except Exception:
+        pass
+    # 兜底: tasklist 按 PID 查
+    try:
+        out = subprocess.run(
+            ["tasklist", "/fi", f"PID eq {pid}", "/fo", "csv", "/nh"],
+            capture_output=True, text=True, encoding="gbk", errors="ignore",
+        ).stdout
+        return f'"{pid}"' in out.replace(" ", "")
     except Exception:
         return False
 
 
+def _find_xiadan_window():
+    """枚举桌面可见主窗口, 返回 (hwnd, pid) of 标题含'股票交易'的窗口; 无则 (None, None).
+    这是定位真实 xiadan 最可靠的方式: 不依赖进程名、不依赖本服务是否已连接."""
+    best = [None, None]
+    def _enum(hwnd, _):
+        if not win32gui.IsWindowVisible(hwnd):
+            return
+        if win32gui.GetClassName(hwnd) == "#32770":
+            return  # 跳过对话框(验证码/弹窗), 只认交易主窗口
+        t = win32gui.GetWindowText(hwnd) or ""
+        if "股票交易" in t:
+            _, pid = win32process.GetWindowThreadProcessId(hwnd)
+            best[0], best[1] = hwnd, pid
+    try:
+        win32gui.EnumWindows(_enum, None)
+    except Exception:
+        pass
+    return best[0], best[1]
+
+
 def _find_xiadan_pid():
-    """扫描是否有 xiadan.exe 进程在跑, 返回其 PID 或 None (不依赖本服务是否已连接)."""
+    """返回当前真实 xiadan 主窗口所属进程 PID (优先按窗口标题枚举, 兜底 tasklist 进程名)."""
+    hwnd, pid = _find_xiadan_window()
+    if pid:
+        return pid
+    # 兜底: 万一窗口标题不匹配, 退而用进程名扫描
     try:
         out = subprocess.run(
             ["tasklist", "/fi", "IMAGENAME eq xiadan.exe", "/fo", "csv", "/nh"],
@@ -1696,8 +1734,9 @@ def _find_xiadan_pid():
 
 
 def _launch_xiadan():
-    """启动 xiadan.exe (账号已保存, 会自动登录). 返回新进程 PID."""
-    proc = subprocess.Popen([EXE_PATH], creationflags=0x08000000)  # CREATE_NO_WINDOW
+    """启动 xiadan.exe (账号已保存, 会自动登录). 返回新进程 PID.
+    仅在桌面上确无 xiadan 窗口时才调用(避免单实例冲突); 正常拉起即可."""
+    proc = subprocess.Popen([EXE_PATH])
     print(f"[info] 已启动 xiadan.exe pid={proc.pid} ({EXE_PATH})")
     return proc.pid
 
@@ -1718,20 +1757,24 @@ def _wait_for_main_window(pid, timeout):
 
 
 def _xiadan_alive():
-    """本服务当前连接的 xiadan 客户端是否存活(进程在 + 主窗口可达)."""
+    """真实 xiadan 主窗口是否在桌面上, 且本服务已连上同一个进程.
+    仅当'窗口存在 + 我们连的就是该 pid + 进程存活'才视为活着, 避免误判.
+    注意: u._app.process 可能是字符串, 统一 int() 后再比较/探测."""
+    hwnd, wpid = _find_xiadan_window()
+    if hwnd is None or not wpid:
+        return False  # 桌面上根本没有 xiadan 主窗口 -> 确死
     u = global_store.get("user")
     if u is None or not getattr(u, "_app", None):
-        return False
+        return False  # 窗口在, 但本服务还没连 -> 交由 _ensure_xiadan 复用重连
     try:
-        pid = u._app.process
-        if not _pid_alive(pid):
-            return False
-        main = _find_main_window(u._app)
-        if main is None:
-            return False
-        return bool(win32gui.IsWindow(main.handle))
+        upid = int(u._app.process)
     except Exception:
         return False
+    if not _pid_alive(upid):
+        return False
+    if upid != int(wpid):
+        return False  # 我们连的是别的(可能僵死)进程 -> 需要重连到真实窗口
+    return True
 
 
 def _switch_account_core(target_idx):
@@ -1841,10 +1884,11 @@ def _do_prepare(user, *, broker=None, label="main", exe_path=None, pid=None, gri
 
 
 def _reconnect_to(pid):
-    """用现有/新建的 ClientTrader 连接到给定 pid 的 xiadan, 重跑 prepare + 重切账户."""
+    """用现有/新建的 ClientTrader 连接到给定 pid 的 xiadan, 重跑 prepare + 重切账户.
+    若现有 user 的连接已僵死, 则新建 ClientTrader 再连(避免重连失败)."""
     user = global_store.get("user")
     broker = global_store.get("_last_broker") or "ths"
-    if user is None:
+    if user is None or not getattr(user, "_app", None) or not _pid_alive(user._app.process):
         user = _et_api.use(broker)
     _do_prepare(
         user,
@@ -1867,9 +1911,11 @@ def _ensure_xiadan(force=False):
             _u = global_store.get("user")
             _xiadan_pid = _u._app.process if _u and getattr(_u, "_app", None) else _xiadan_pid
             return True
-        # 1) 已有 xiadan 进程在跑(可能本服务失联) -> 复用, 不新开(避免多实例)
-        existing = _find_xiadan_pid()
-        if existing and existing != _xiadan_pid:
+        # 1) 桌面上已有真实 xiadan 主窗口 -> 复用重连, 绝不新开进程(同花顺单实例)
+        hwnd, existing = _find_xiadan_window()
+        if not hwnd:
+            existing = _find_xiadan_pid()  # 兜底: 窗口标题没匹配时用进程名
+        if existing:
             try:
                 _reconnect_to(existing)
                 _xiadan_status = "ok"
@@ -1879,7 +1925,11 @@ def _ensure_xiadan(force=False):
                 return True
             except Exception as e:
                 print(f"[warn] 复用现有 xiadan 进程失败: {e}")
-        # 2) 没进程 -> 启动新进程(受最大重试与冷却约束)
+                # 窗口还在但重连失败 -> 不急着拉起(单实例, 拉起无用), 等下次重试
+                if hwnd:
+                    _xiadan_status = "recovering"
+                    return False
+        # 2) 桌面上没有任何 xiadan 窗口 -> 才启动新进程(受最大重试与冷却约束)
         if not force and _auto_retry_count >= CLIENT_MAX_AUTO_RETRIES:
             _xiadan_status = "broken"
             print(f"[warn] xiadan 连续自动拉起失败达上限({CLIENT_MAX_AUTO_RETRIES}), 停止自动拉起, 需手动 POST /xiadan/start")
