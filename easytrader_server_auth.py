@@ -1077,16 +1077,17 @@ def _patch_copy_get():
             return ""
 
     def _robust_copy_keys(copy_self, grid):
-        """可靠地把 grid 内容复制进剪贴板: 先置前台 + 置键盘焦点, 再发 ^A^C.
-        关键: 必须给 grid 设键盘焦点 + 把同花顺窗口置前台, 否则后台进程前台锁会导致
-        SendInput 的 Ctrl+C 打到别的窗口 -> 复制偶发落空(之前 ~50% 失败根因).
-        【精简无效行为·去除甩鼠标】原 grid.set_focus() 会触发 pywinauto HwndWrapper.set_focus
-        把鼠标甩到 (-10000,500) 屏幕外(=用户看到的"鼠标停留到下单窗口外空白处"根因);
-        type_keys(set_foreground=True) 内部还会再调一次 set_focus 重复甩鼠标。
-        改为 grid.set_keyboard_focus()(仅 AttachThreadInput + win32gui.SetFocus 设键盘焦点,
-        完全不碰鼠标) + type_keys(set_foreground=False), 保留"点击表格获取焦点"的语义但不再移动鼠标。
-        —— 回退方式: 把 grid.set_keyboard_focus() 改回 grid.set_focus(),
-            grid.type_keys("^A^C", set_foreground=False) 改回 set_foreground=True。"""
+        """可靠地把 grid 内容复制进剪贴板. 消息化优先 + 键盘回退(兼顾"更稳"与"已知可靠"):
+          1) 置前台 + 置键盘焦点(不移动鼠标, 同 _set_foreground + set_keyboard_focus);
+          2) 优先 PostMessage(grid, WM_COMMAND, 0xE122, 0) 触发同花顺内置"复制"——
+             纯消息、不依赖键鼠模拟; 若该 grid 识别则直接产出剪贴板内容, 最稳;
+          3) 若消息未产出内容: 检查是否消息复制已触发"股票复制识别"验证码(风控针对复制动作本身)——
+             是则立即返回, 交上层 _solve_if_captcha 解卡后读剪贴板, 绝不补 ^A^C
+             (避免同一次查询双触发验证码/双弹窗这一已知坑);
+             否则回退 grid.type_keys("^A^C", set_foreground=False)(已知 6/6 可靠,
+             且本分支确认无验证码, 属单次复制).
+        —— 回退: 删除整段 WM_COMMAND 优先逻辑, 仅保留下面 _set_foreground + set_keyboard_focus + ^A^C 即可还原旧行为。"""
+        import win32gui, win32con
         try:
             copy_self._set_foreground(grid)   # 仍把同花顺窗口置前台(SetForegroundWindow, 不移动鼠标)
         except Exception:
@@ -1096,7 +1097,22 @@ def _patch_copy_get():
             grid.set_keyboard_focus()         # 仅设键盘焦点, 不移动鼠标(替代 grid.set_focus)
         except Exception:
             pass
-        _wait(0.03)  # 原 0.05 (缩短提速; 回退改回 0.05)
+        _wait(0.03)  # 置焦点后沉降(正确性交点; 回退改回 0.05)
+        hwnd = int(grid.handle)
+        # --- 优先: 消息化复制(无需键鼠模拟) ---
+        # 该 grid 是否响应 WM_COMMAND(0xE122=同花顺复制命令候选)需在真机验证;
+        # 仅当剪贴板确实产出内容才视为成功, 否则走下方回退, 保证快速路径不退化.
+        try:
+            win32gui.PostMessage(hwnd, win32con.WM_COMMAND, 0xE122, 0)
+            _wait(0.05)
+            if _clip_has(copy_self._safe_read_clip()):
+                return  # 消息复制成功, 不再发 ^A^C
+        except Exception:
+            pass
+        # 消息未产出: 若已触发验证码, 交上层解卡(不补 ^A^C, 防双弹窗)
+        if _get_captcha_dialog() is not None:
+            return
+        # --- 回退: ^A^C 键盘(已知可靠) ---
         try:
             # 【已注释·回退用】grid.type_keys("^A^C", set_foreground=True)
             grid.type_keys("^A^C", set_foreground=False)  # 不触发 set_focus, 不再移鼠标
