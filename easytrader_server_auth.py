@@ -769,14 +769,21 @@ def _enter_code(dlg, code, img):
 
     def keybd_send(text):
         for ch in text:
-            vk = win32api.VkKeyScan(ch)
-            if vk == -1:
-                continue
-            vk_code = vk & 0xFF
-            win32api.keybd_event(vk_code, 0, 0, 0)
-            _wait(0.02)  # 原 0.03 (缩短提速; 回退改回 0.03)
-            win32api.keybd_event(vk_code, 0, win32con.KEYEVENTF_KEYUP, 0)
-            _wait(0.02)  # 原 0.03 (缩短提速; 回退改回 0.03)
+            try:
+                # 【修复·根因】焦点已确凿在编辑框(诊断验证 focus==eh), 直接给编辑框 PostMessage WM_CHAR:
+                # Edit 控件收到即插入字符, 绕开 keybd_event(已废弃 API)在焦点正确时仍不产生 WM_CHAR 的坑。
+                # 这是 closed=False 的真正根因——之前键击全丢导致码没进框。lParam=1 表示重复计数1。
+                win32gui.PostMessage(eh, win32con.WM_CHAR, ord(ch), 1)
+            except Exception as e:
+                print("[warn] PostMessage WM_CHAR 失败, 回退 keybd_event:", e)
+                vk = win32api.VkKeyScan(ch)
+                if vk == -1:
+                    continue
+                vk_code = vk & 0xFF
+                win32api.keybd_event(vk_code, 0, 0, 0)
+                _wait(0.02)
+                win32api.keybd_event(vk_code, 0, win32con.KEYEVENTF_KEYUP, 0)
+                _wait(0.02)
 
     try:
         # 配置项 MOVE_WINDOWS(默认 False=不移动弹窗): 开启时把验证码弹窗移入固定左上角(100,100)可见区
@@ -801,26 +808,37 @@ def _enter_code(dlg, code, img):
             win32gui.SetForegroundWindow(dlg_hwnd)
         except Exception as e:
             print("[warn] SetForegroundWindow 异常:", e)
-        _wait(0.08)  # 原 0.12 (缩短提速; 回退改回 0.12)
+        _t.sleep(max(0.08 * WAIT_MULT, 0.06))  # 设前台后保底等待(正确性关键, 不随倍率缩到失效; 原 _wait(0.12))
         try:
             win32gui.SetFocus(eh)
         except Exception as e:
             print("[warn] SetFocus 失败:", e)
-        _wait(0.08)  # 原 0.12 (缩短提速; 回退改回 0.12)
+        _t.sleep(max(0.08 * WAIT_MULT, 0.06))  # 设焦点后保底等待(正确性关键; 原 _wait(0.12))
         # 清空 + 键入
-        win32api.keybd_event(0x11, 0, 0, 0)
-        win32api.keybd_event(ord('A'), 0, 0, 0)
-        _wait(0.02)  # 原 0.04 (缩短提速; 回退改回 0.04)
-        win32api.keybd_event(ord('A'), 0, win32con.KEYEVENTF_KEYUP, 0)
-        win32api.keybd_event(0x11, 0, win32con.KEYEVENTF_KEYUP, 0)
-        _wait(0.02)  # 原 0.04 (缩短提速; 回退改回 0.04)
-        keybd_send(code)
-        _wait(0.05)  # 原 0.08 (缩短提速; 回退改回 0.08)
-        # 提交: 回车
+        # 【修复·兼容性】每次输入前强制清空编辑框, 避免上次输错残留导致正确码被追加(对也变错)。
+        # 同花顺验证码输入框是自定义控件, win32 EM_SETSEL/WM_CLEAR 未必生效, 故以"键盘全选+Delete"为主清空;
+        # 且清空相关键序等待用保底下限 max(sec*WAIT_MULT, 0.05), 倍率压到 0/0.25 也不失效(否则 Ctrl+A 被吞→累加)。
+        _EM_SETSEL = getattr(win32con, 'EM_SETSEL', 0xB1)
+        _WM_CLEAR = getattr(win32con, 'WM_CLEAR', 0x303)
+        def _wait_crit(sec):
+            _t.sleep(max(sec * WAIT_MULT, 0.05))  # 正确性关键等待下限 50ms
+        # 清空: 焦点已确凿在 eh(诊断验证 focus==eh), 用 Edit 标准消息 EM_SETSEL(0,-1)+WM_CLEAR 同步清空,
+        # 可靠且不受倍率影响; 失败才回退键盘 Ctrl+A+Delete(键击法在焦点下偶发不可靠)。
+        try:
+            win32gui.SendMessage(eh, _EM_SETSEL, 0, -1)
+            win32gui.SendMessage(eh, _WM_CLEAR, 0, 0)
+        except Exception as e:
+            print("[warn] EM_SETSEL/WM_CLEAR 清空失败(回退键盘 Ctrl+A+Delete):", e)
+            win32api.keybd_event(0x11, 0, 0, 0); win32api.keybd_event(ord('A'), 0, 0, 0); _wait_crit(0.04)
+            win32api.keybd_event(ord('A'), 0, win32con.KEYEVENTF_KEYUP, 0); win32api.keybd_event(0x11, 0, win32con.KEYEVENTF_KEYUP, 0); _wait_crit(0.04)
+            win32api.keybd_event(0x2E, 0, 0, 0); win32api.keybd_event(0x2E, 0, win32con.KEYEVENTF_KEYUP, 0); _wait_crit(0.04)
+        keybd_send(code)  # 输入正确码; 字符间隔用 _wait(可缩放, 非正确性关键)
+        _t.sleep(max(0.05 * WAIT_MULT, 0.04))  # 输入后保底(原 _wait(0.08))
+        # 提交: 回车(保底等待, 提交关键)
         win32api.keybd_event(0x0D, 0, 0, 0)
-        _wait(0.02)  # 原 0.04 (缩短提速; 回退改回 0.04)
+        _wait_crit(0.03)  # 保底(原 _wait(0.04))
         win32api.keybd_event(0x0D, 0, win32con.KEYEVENTF_KEYUP, 0)
-        _wait(0.18)  # 原 0.35 (缩短提速; 关闭由下方轮询确认, 回退改回 0.35)
+        _t.sleep(max(0.18 * WAIT_MULT, 0.10))  # 等关闭保底(原 _wait(0.35))
         if _dialog_still_open(dlg):
             try:
                 win32gui.SendMessage(bh, win32con.BM_CLICK, 0, 0)
@@ -1273,8 +1291,8 @@ try:
     WAIT_MULT = float(os.environ.get("EASYTRADER_WAIT_MULTIPLIER", str(CONFIG["wait_multiplier"])) or 1.0)
 except Exception:
     WAIT_MULT = 1.0
-if WAIT_MULT <= 0:
-    WAIT_MULT = 1.0
+# 注: WAIT_MULT=0 表示"完全不等待"——_wait(sec) 算得 s=0, 经下方 `if s>0` 直接跳过(不 sleep、不报错)。
+# 不再把 <=0 回退为 1.0, 这是用户要的极限档(纯跳过)。负数同理视为跳过(sleep 不会被传入负值)。
 
 
 def _wait(sec):
