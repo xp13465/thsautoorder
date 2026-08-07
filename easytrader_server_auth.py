@@ -1949,11 +1949,16 @@ def _launch_xiadan():
     仅在桌面上确无 xiadan 窗口时才调用(避免单实例冲突).
     启动前先等残留 xiadan.exe 完全退出: 否则新实例会因单实例锁冲突而立即退出
     (表现为"拉起一下又消失"), 尤其"杀进程后立刻请求"的极端时序.
-    启动后若开启 client_hide_console, 隐藏其控制台黑框(保留 GUI 交易窗口)."""
+    启动后若开启 client_hide_console, 隐藏其控制台黑框(保留 GUI 交易窗口).
+
+    启动方式严格等价于"在命令行里直接执行 D:\\同花顺软件\\同花顺\\同花顺\\同花顺\\xiadan.exe":
+    工作目录设为 exe 所在目录 + 完整继承当前用户环境变量. 这样同花顺能像用户手动启动那样
+    找到已保存的账号配置, 不会出现空白登录窗. 不额外篡改任何环境."""
     _wait_for_xiadan_exit(5.0)
     before = _snapshot_console_hwnds()
-    proc = subprocess.Popen([EXE_PATH])
-    print(f"[info] 已启动 xiadan.exe pid={proc.pid} ({EXE_PATH})")
+    exe_dir = os.path.dirname(EXE_PATH)
+    proc = subprocess.Popen([EXE_PATH], cwd=exe_dir, env=dict(os.environ))
+    print(f"[info] 已启动 xiadan.exe pid={proc.pid} ({EXE_PATH}) cwd={exe_dir}")
     if CLIENT_HIDE_CONSOLE:
         _hide_new_consoles(before)
     return proc.pid
