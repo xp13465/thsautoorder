@@ -754,9 +754,9 @@ def _enter_code(dlg, code, img):
                 continue
             vk_code = vk & 0xFF
             win32api.keybd_event(vk_code, 0, 0, 0)
-            _t.sleep(0.03)
+            _t.sleep(0.02)  # 原 0.03 (缩短提速; 回退改回 0.03)
             win32api.keybd_event(vk_code, 0, win32con.KEYEVENTF_KEYUP, 0)
-            _t.sleep(0.03)
+            _t.sleep(0.02)  # 原 0.03 (缩短提速; 回退改回 0.03)
 
     try:
         # 配置项 MOVE_WINDOWS(默认 False=不移动弹窗): 开启时把验证码弹窗移入固定左上角(100,100)可见区
@@ -781,32 +781,32 @@ def _enter_code(dlg, code, img):
             win32gui.SetForegroundWindow(dlg_hwnd)
         except Exception as e:
             print("[warn] SetForegroundWindow 异常:", e)
-        _t.sleep(0.12)
+        _t.sleep(0.08)  # 原 0.12 (缩短提速; 回退改回 0.12)
         try:
             win32gui.SetFocus(eh)
         except Exception as e:
             print("[warn] SetFocus 失败:", e)
-        _t.sleep(0.12)
+        _t.sleep(0.08)  # 原 0.12 (缩短提速; 回退改回 0.12)
         # 清空 + 键入
         win32api.keybd_event(0x11, 0, 0, 0)
         win32api.keybd_event(ord('A'), 0, 0, 0)
-        _t.sleep(0.04)
+        _t.sleep(0.02)  # 原 0.04 (缩短提速; 回退改回 0.04)
         win32api.keybd_event(ord('A'), 0, win32con.KEYEVENTF_KEYUP, 0)
         win32api.keybd_event(0x11, 0, win32con.KEYEVENTF_KEYUP, 0)
-        _t.sleep(0.04)
+        _t.sleep(0.02)  # 原 0.04 (缩短提速; 回退改回 0.04)
         keybd_send(code)
-        _t.sleep(0.08)
+        _t.sleep(0.05)  # 原 0.08 (缩短提速; 回退改回 0.08)
         # 提交: 回车
         win32api.keybd_event(0x0D, 0, 0, 0)
-        _t.sleep(0.04)
+        _t.sleep(0.02)  # 原 0.04 (缩短提速; 回退改回 0.04)
         win32api.keybd_event(0x0D, 0, win32con.KEYEVENTF_KEYUP, 0)
-        _t.sleep(0.35)
+        _t.sleep(0.18)  # 原 0.35 (缩短提速; 关闭由下方轮询确认, 回退改回 0.35)
         if _dialog_still_open(dlg):
             try:
                 win32gui.SendMessage(bh, win32con.BM_CLICK, 0, 0)
             except Exception:
                 pass
-            _t.sleep(0.35)
+            _t.sleep(0.20)  # 原 0.35 (缩短提速; 回退改回 0.35)
     finally:
         if attached:
             try:
@@ -1048,7 +1048,7 @@ def _patch_copy_get():
             grid.set_keyboard_focus()         # 仅设键盘焦点, 不移动鼠标(替代 grid.set_focus)
         except Exception:
             pass
-        _t.sleep(0.05)
+        _t.sleep(0.03)  # 原 0.05 (缩短提速; 回退改回 0.05)
         try:
             # 【已注释·回退用】grid.type_keys("^A^C", set_foreground=True)
             grid.type_keys("^A^C", set_foreground=False)  # 不触发 set_focus, 不再移鼠标
