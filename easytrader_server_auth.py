@@ -894,17 +894,71 @@ def _enter_code(dlg, code, img):
     print(f"[perf] _enter_code 填入阶段耗时={_t.time()-t_enter:.3f}s")
 
 
+def _refresh_captcha(dlg):
+    """点击验证码图片区域, 强制同花顺换一张新验证码(避免死磕同一张反复识别失败).
+    点击目标: 对话框内'数字条'中心(由 _CAPTCHA_DIGIT_BOX 推算, 即验证码图片所在处)所覆盖的
+    最大非 Edit/Button 子控件; 找不到则退化为直接点对话框该坐标.
+    通过给该控件发 WM_LBUTTONDOWN/LBUTTONUP 消息触发刷新(SS_NOTIFY 静态控件会向父窗口
+    发 STN_CLICKED 从而换图), 不移动真实鼠标, 不干扰用户布局."""
+    import win32gui, win32con
+    try:
+        r = dlg.rectangle()
+        a, b, c, d = _CAPTCHA_DIGIT_BOX
+        cx = r.left + int(((a + c) / 2.0) * r.width())
+        cy = r.top + int(((b + d) / 2.0) * r.height())
+        target_hwnd = None
+        try:
+            best_area = 0
+            for ctl in dlg.descendants():
+                cls = (ctl.class_name() or "")
+                if cls in ("Edit", "Button"):
+                    continue
+                try:
+                    cr = ctl.rectangle()
+                except Exception:
+                    continue
+                if cr.width() <= 8 or cr.height() <= 8:
+                    continue
+                if cr.left <= cx <= cr.right and cr.top <= cy <= cr.bottom:
+                    area = cr.width() * cr.height()
+                    if area > best_area:
+                        best_area = area
+                        target_hwnd = int(ctl.handle)
+        except Exception:
+            target_hwnd = None
+        if target_hwnd:
+            hwnd = target_hwnd
+            cr = win32gui.GetWindowRect(hwnd)
+            rx = (cr[2] - cr[0]) // 2
+            ry = (cr[3] - cr[1]) // 2
+            print(f"[info] 刷新验证码: 命中图片控件 hwnd={hwnd} rect=({cr[0]},{cr[1]},{cr[2]},{cr[3]}) 发鼠标点击")
+        else:
+            hwnd = int(dlg.handle)
+            rc = win32gui.GetWindowRect(hwnd)
+            rx = cx - rc[0]
+            ry = cy - rc[1]
+            print(f"[info] 刷新验证码: 未定位图片控件, 对对话框({cx},{cy})发鼠标点击")
+        lp = (ry << 16) | (rx & 0xFFFF)
+        win32gui.SendMessage(hwnd, win32con.WM_LBUTTONDOWN, 0, lp)
+        win32gui.SendMessage(hwnd, win32con.WM_LBUTTONUP, 0, lp)
+    except Exception as e:
+        print("[warn] 刷新验证码异常:", e)
+    _wait(0.5)  # 等刷新后的新图渲染稳定
+
+
 def _solve_captcha(max_attempts=None, dlg=None):
     """只要验证码弹窗在, 就一直处理: 循环 检测->截图->OCR->填入->确认->验证关闭.
     dlg: 可选, 由 _solve_if_captcha 已找到的弹窗句柄传入, 避免重复全桌面枚举(优化1).
     用户准则:
       - 输错码 -> 弹窗提示验证码错误并仍开着(不会关闭) -> 视为未关闭, 重新识别再试;
       - 置信度不足/识别为空 -> 多半是截图问题 -> 重截并重试, 绝不因此放弃或瞎填;
+      - 同一张验证码连续失败达到 captcha_refresh_after 次 -> 点击图片强制换新, 绝不死磕同一张;
       - 有弹窗就必须处理, 直到真正关闭; 关闭即解卡成功, 调用方即可读到正确剪贴板
         (弹窗打断了复制, 解卡后同花顺自动把本次复制内容落盘, 绝不再发复制以免再次触发验证码死循环).
     返回 True 表示弹窗已关闭."""
     if max_attempts is None:
         max_attempts = CAPTCHA_MAX_ATTEMPTS
+    refresh_after = CAPTCHA_REFRESH_AFTER
     from PIL import Image
     import numpy as np
     # 优化1: 优先复用调用方已找到的弹窗句柄, 仅在缺失/失效时重新枚举(省 ~200ms)
@@ -913,6 +967,7 @@ def _solve_captcha(max_attempts=None, dlg=None):
     if dlg is None:
         return False
     solved = False
+    same_captcha_fails = 0   # 当前这张验证码连续失败次数(输错/读不出4位)
     for attempt in range(1, max_attempts + 1):
         _ta = _t.time()
         _perf_mark(f"cap_attempt{attempt}_start")
@@ -933,7 +988,12 @@ def _solve_captcha(max_attempts=None, dlg=None):
         _perf_mark(f"cap{attempt}_cap")
         if img is None:
             print(f"[warn] 验证码尝试{attempt}: 截图失败, 重试")
-            _wait(0.3)
+            same_captcha_fails += 1
+            if same_captcha_fails >= refresh_after:
+                _refresh_captcha(dlg)
+                same_captcha_fails = 0
+            else:
+                _wait(0.3)
             continue
         _t_ocr = _t.time()
         code, conf = _ocr_captcha(img)
@@ -943,7 +1003,12 @@ def _solve_captcha(max_attempts=None, dlg=None):
         # 没拿到 4 位码 -> 视为截图问题, 重截重试(不放弃、不瞎填错误码)
         if not code or len(code) != 4:
             _save_capture(img, code, conf, False, f"尝试{attempt}: 识别为空/非4位(重截重试)")
-            _wait(0.35)
+            same_captcha_fails += 1
+            if same_captcha_fails >= refresh_after:
+                _refresh_captcha(dlg)
+                same_captcha_fails = 0
+            else:
+                _wait(0.35)
             print(f"[perf] attempt{attempt}: 截图={_dt_cap:.3f}s OCR={_dt_ocr:.3f}s 阶段=空码重截 合计={_t.time()-_ta:.3f}s")
             continue
         _t_enter = _t.time()
@@ -971,9 +1036,15 @@ def _solve_captcha(max_attempts=None, dlg=None):
         if closed:
             solved = True
             break
-        # 未关闭 -> 输错或提交未生效 -> THS 刷新验证码, 等一下重截重识别再试
-        print(f"[info] 验证码尝试{attempt} 后弹窗未关闭, 重截重识别重试")
-        _wait(0.5)
+        # 未关闭 -> 输错或提交未生效 -> 累计失败次数, 达到阈值则点击图片换新, 否则重截重识别
+        same_captcha_fails += 1
+        if same_captcha_fails >= refresh_after:
+            print(f"[info] 验证码尝试{attempt}: 当前码连续失败{same_captcha_fails}次, 点击图片刷新新验证码")
+            _refresh_captcha(dlg)
+            same_captcha_fails = 0
+        else:
+            print(f"[info] 验证码尝试{attempt}: 弹窗未关闭, 重截重识别重试(同码第{same_captcha_fails}次)")
+            _wait(0.5)
     print(f"[info] 解卡结束 solved={solved}")
     return solved
 
@@ -1359,12 +1430,18 @@ except Exception:
     WAIT_MULT = 1.0
 # 注: WAIT_MULT=0 表示"完全不等待"——_wait(sec) 算得 s=0, 经下方 `if s>0` 直接跳过(不 sleep、不报错)。
 # 不再把 <=0 回退为 1.0, 这是用户要的极限档(纯跳过)。负数同理视为跳过(sleep 不会被传入负值)。
-# 配置项: 验证码解卡最大尝试次数(默认 20). 环境变量 EASYTRADER_CAPTCHA_MAX_ATTEMPTS 可临时覆盖;
-# 同花顺输错验证码会刷新出新的码, 多尝试几次能显著提高最终认对/解卡的概率.
+# 验证码解卡:
+#  - captcha_max_attempts: 单轮解卡最大尝试次数(默认 10). 环境变量 EASYTRADER_CAPTCHA_MAX_ATTEMPTS 可临时覆盖.
+#  - captcha_refresh_after: 同一张验证码连续失败几次后点击图片强制换新(默认 2). 配合"输错就换新"避免死磕
+#    同一张, 10 次尝试≈可测 3~4 张验证码(并非每张都识别失败). 环境变量 EASYTRADER_CAPTCHA_REFRESH_AFTER 可覆盖.
 try:
-    CAPTCHA_MAX_ATTEMPTS = int(os.environ.get("EASYTRADER_CAPTCHA_MAX_ATTEMPTS", str(CONFIG["captcha_max_attempts"])) or 20)
+    CAPTCHA_MAX_ATTEMPTS = int(os.environ.get("EASYTRADER_CAPTCHA_MAX_ATTEMPTS", str(CONFIG["captcha_max_attempts"])) or 10)
 except Exception:
-    CAPTCHA_MAX_ATTEMPTS = 20
+    CAPTCHA_MAX_ATTEMPTS = 10
+try:
+    CAPTCHA_REFRESH_AFTER = int(os.environ.get("EASYTRADER_CAPTCHA_REFRESH_AFTER", str(CONFIG["captcha_refresh_after"])) or 2)
+except Exception:
+    CAPTCHA_REFRESH_AFTER = 2
 
 # ==================== 客户端守护(同花顺 xiadan.exe)配置/运行时状态 ====================
 try:
