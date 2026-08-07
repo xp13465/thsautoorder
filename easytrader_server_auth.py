@@ -206,7 +206,7 @@ def _gui_worker():
             t_thr0 = _t.time()
             elapsed = _t.time() - _WORKER_LAST_TS
             if elapsed < _MIN_GRID_INTERVAL:
-                _t.sleep(_MIN_GRID_INTERVAL - elapsed)
+                _wait(_MIN_GRID_INTERVAL - elapsed)
             throttle = _t.time() - t_thr0
             if job.perf:
                 job.perf.mark("throttle")
@@ -565,6 +565,26 @@ def _dialog_still_open(dlg):
         return True
 
 
+def _dialog_closed(dlg):
+    """轻量判断缓存弹窗是否已关闭(用于关闭轮询, 不每次全桌面枚举, 省开销).
+    优先用句柄 IsWindow 判定; 句柄失效时再一次性枚举确认没有别的验证码弹窗
+    (防同花顺刷新验证码时重建窗口导致的漏判). 与 _dialog_still_open 互为反义, 但本函数不依赖
+    矩形(句柄销毁即视为关闭, 更贴合"关闭轮询"语义). 异常时保守返回 False(视为仍开着, 继续等)."""
+    try:
+        if dlg is not None:
+            h = int(getattr(dlg, "handle", 0) or 0)
+            if h:
+                if win32gui.IsWindow(h):
+                    return False
+    except Exception:
+        pass
+    # 句柄已失效 -> 一次性枚举确认确实无验证码弹窗(捕获"重建窗口"边缘情况)
+    try:
+        return _get_captcha_dialog() is None
+    except Exception:
+        return False
+
+
 def _capture_dialog_image(dlg):
     """截取验证码对话框区域为 PIL 图像. 优先 capture_as_image, 失败回退 ImageGrab.
     注意: 32 位同花顺子窗口经 64 位 Python 调用 capture_as_image 时, 偶尔会截到主窗口
@@ -754,9 +774,9 @@ def _enter_code(dlg, code, img):
                 continue
             vk_code = vk & 0xFF
             win32api.keybd_event(vk_code, 0, 0, 0)
-            _t.sleep(0.02)  # 原 0.03 (缩短提速; 回退改回 0.03)
+            _wait(0.02)  # 原 0.03 (缩短提速; 回退改回 0.03)
             win32api.keybd_event(vk_code, 0, win32con.KEYEVENTF_KEYUP, 0)
-            _t.sleep(0.02)  # 原 0.03 (缩短提速; 回退改回 0.03)
+            _wait(0.02)  # 原 0.03 (缩短提速; 回退改回 0.03)
 
     try:
         # 配置项 MOVE_WINDOWS(默认 False=不移动弹窗): 开启时把验证码弹窗移入固定左上角(100,100)可见区
@@ -781,32 +801,32 @@ def _enter_code(dlg, code, img):
             win32gui.SetForegroundWindow(dlg_hwnd)
         except Exception as e:
             print("[warn] SetForegroundWindow 异常:", e)
-        _t.sleep(0.08)  # 原 0.12 (缩短提速; 回退改回 0.12)
+        _wait(0.08)  # 原 0.12 (缩短提速; 回退改回 0.12)
         try:
             win32gui.SetFocus(eh)
         except Exception as e:
             print("[warn] SetFocus 失败:", e)
-        _t.sleep(0.08)  # 原 0.12 (缩短提速; 回退改回 0.12)
+        _wait(0.08)  # 原 0.12 (缩短提速; 回退改回 0.12)
         # 清空 + 键入
         win32api.keybd_event(0x11, 0, 0, 0)
         win32api.keybd_event(ord('A'), 0, 0, 0)
-        _t.sleep(0.02)  # 原 0.04 (缩短提速; 回退改回 0.04)
+        _wait(0.02)  # 原 0.04 (缩短提速; 回退改回 0.04)
         win32api.keybd_event(ord('A'), 0, win32con.KEYEVENTF_KEYUP, 0)
         win32api.keybd_event(0x11, 0, win32con.KEYEVENTF_KEYUP, 0)
-        _t.sleep(0.02)  # 原 0.04 (缩短提速; 回退改回 0.04)
+        _wait(0.02)  # 原 0.04 (缩短提速; 回退改回 0.04)
         keybd_send(code)
-        _t.sleep(0.05)  # 原 0.08 (缩短提速; 回退改回 0.08)
+        _wait(0.05)  # 原 0.08 (缩短提速; 回退改回 0.08)
         # 提交: 回车
         win32api.keybd_event(0x0D, 0, 0, 0)
-        _t.sleep(0.02)  # 原 0.04 (缩短提速; 回退改回 0.04)
+        _wait(0.02)  # 原 0.04 (缩短提速; 回退改回 0.04)
         win32api.keybd_event(0x0D, 0, win32con.KEYEVENTF_KEYUP, 0)
-        _t.sleep(0.18)  # 原 0.35 (缩短提速; 关闭由下方轮询确认, 回退改回 0.35)
+        _wait(0.18)  # 原 0.35 (缩短提速; 关闭由下方轮询确认, 回退改回 0.35)
         if _dialog_still_open(dlg):
             try:
                 win32gui.SendMessage(bh, win32con.BM_CLICK, 0, 0)
             except Exception:
                 pass
-            _t.sleep(0.20)  # 原 0.35 (缩短提速; 回退改回 0.35)
+            _wait(0.20)  # 原 0.35 (缩短提速; 回退改回 0.35)
     finally:
         if attached:
             try:
@@ -816,8 +836,9 @@ def _enter_code(dlg, code, img):
     print(f"[perf] _enter_code 填入阶段耗时={_t.time()-t_enter:.3f}s")
 
 
-def _solve_captcha(max_attempts=6):
+def _solve_captcha(max_attempts=6, dlg=None):
     """只要验证码弹窗在, 就一直处理: 循环 检测->截图->OCR->填入->确认->验证关闭.
+    dlg: 可选, 由 _solve_if_captcha 已找到的弹窗句柄传入, 避免重复全桌面枚举(优化1).
     用户准则:
       - 输错码 -> 弹窗提示验证码错误并仍开着(不会关闭) -> 视为未关闭, 重新识别再试;
       - 置信度不足/识别为空 -> 多半是截图问题 -> 重截并重试, 绝不因此放弃或瞎填;
@@ -826,7 +847,9 @@ def _solve_captcha(max_attempts=6):
     返回 True 表示弹窗已关闭."""
     from PIL import Image
     import numpy as np
-    dlg = _get_captcha_dialog()
+    # 优化1: 优先复用调用方已找到的弹窗句柄, 仅在缺失/失效时重新枚举(省 ~200ms)
+    if dlg is None or not _dialog_still_open(dlg):
+        dlg = _get_captcha_dialog()
     if dlg is None:
         return False
     solved = False
@@ -845,12 +868,12 @@ def _solve_captcha(max_attempts=6):
                         break
             except Exception:
                 pass
-            time.sleep(0.25)
+            _wait(0.25)
         _dt_cap = _t.time() - _t_cap
         _perf_mark(f"cap{attempt}_cap")
         if img is None:
             print(f"[warn] 验证码尝试{attempt}: 截图失败, 重试")
-            time.sleep(0.3)
+            _wait(0.3)
             continue
         _t_ocr = _t.time()
         code, conf = _ocr_captcha(img)
@@ -860,7 +883,7 @@ def _solve_captcha(max_attempts=6):
         # 没拿到 4 位码 -> 视为截图问题, 重截重试(不放弃、不瞎填错误码)
         if not code or len(code) != 4:
             _save_capture(img, code, conf, False, f"尝试{attempt}: 识别为空/非4位(重截重试)")
-            time.sleep(0.35)
+            _wait(0.35)
             print(f"[perf] attempt{attempt}: 截图={_dt_cap:.3f}s OCR={_dt_ocr:.3f}s 阶段=空码重截 合计={_t.time()-_ta:.3f}s")
             continue
         _t_enter = _t.time()
@@ -872,12 +895,13 @@ def _solve_captcha(max_attempts=6):
         _dt_enter = _t.time() - _t_enter
         _perf_mark(f"cap{attempt}_enter")
         # 轮询确认弹窗已关闭(最多 ~2.0s, 每 0.1s 探一次)
-        # 不用 _dialog_still_open(dlg): 弹窗关闭瞬间 dlg.exists() 可能抛异常导致误判为仍开着.
+        # 优化2: 用缓存句柄 _dialog_closed 判断(句柄 IsWindow + 必要时一次性枚举),
+        # 不再每次全桌面枚举(原 _get_captcha_dialog() 在 32 位弹窗下枚举成本高且循环 20 次浪费).
         closed = False
         _t_wait = _t.time()
         for _ in range(20):
-            time.sleep(0.1)
-            if _get_captcha_dialog() is None:
+            _wait(0.1)
+            if _dialog_closed(dlg):
                 closed = True
                 break
         _dt_wait = _t.time() - _t_wait
@@ -889,7 +913,7 @@ def _solve_captcha(max_attempts=6):
             break
         # 未关闭 -> 输错或提交未生效 -> THS 刷新验证码, 等一下重截重识别再试
         print(f"[info] 验证码尝试{attempt} 后弹窗未关闭, 重截重识别重试")
-        time.sleep(0.5)
+        _wait(0.5)
     print(f"[info] 解卡结束 solved={solved}")
     return solved
 
@@ -973,12 +997,12 @@ def _ensure_xiadan_visible(main_win=None):
             win32gui.SetWindowPos(hwnd, win32con.HWND_TOP, 100, 100, w, h,
                                   win32con.SWP_SHOWWINDOW)
             print(f"[info] xiadan 原位于 ({r.left},{r.top}), 已移回主屏 (100,100)")
-            _t.sleep(0.35)
+            _wait(0.35)
         else:
             try:
                 if main_win.is_minimized() or (not main_win.is_visible()):
                     win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
-                    _t.sleep(0.15)
+                    _wait(0.15)
             except Exception:
                 pass
     except Exception as e:
@@ -997,18 +1021,20 @@ def _solve_if_captcha():
     _perf_mark("cap_detect_start")
     deadline = _t.time() + 0.9
     found = False
+    dlg = None
     while _t.time() < deadline:
-        if _get_captcha_dialog() is not None:
+        dlg = _get_captcha_dialog()
+        if dlg is not None:
             found = True
             break
-        _t.sleep(0.1)
+        _wait(0.1)
     if not found:
         _perf_mark("cap_detect_miss")
         print(f"[perf] _solve_if_captcha: 无弹窗 检测耗时={_t.time()-_t0:.3f}s")
         return False
     _perf_mark("cap_detect_hit")
     print(f"[perf] _solve_if_captcha: 命中弹窗 检测耗时={_t.time()-_t0:.3f}s 开始解卡")
-    return _solve_captcha()
+    return _solve_captcha(dlg=dlg)  # 优化1: 传入已找到的句柄, 避免重复枚举
 
 
 
@@ -1048,7 +1074,7 @@ def _patch_copy_get():
             grid.set_keyboard_focus()         # 仅设键盘焦点, 不移动鼠标(替代 grid.set_focus)
         except Exception:
             pass
-        _t.sleep(0.03)  # 原 0.05 (缩短提速; 回退改回 0.05)
+        _wait(0.03)  # 原 0.05 (缩短提速; 回退改回 0.05)
         try:
             # 【已注释·回退用】grid.type_keys("^A^C", set_foreground=True)
             grid.type_keys("^A^C", set_foreground=False)  # 不触发 set_focus, 不再移鼠标
@@ -1100,7 +1126,7 @@ def _patch_copy_get():
                             content = self._safe_read_clip()
                             if _clip_has(content):
                                 break
-                    _t.sleep(0.2)
+                    _wait(0.2)
         _clear_clipboard()
         _perf_mark("copy_get_end")
         print(f"[perf] robust_get 总耗时={_t.time()-_t0:.3f}s 分支={'captcha' if handled else 'retry_copy'} 解卡耗时={_dt_solve:.3f}s handled={handled}")
@@ -1214,6 +1240,7 @@ def load_config():
         "move_windows": False,  # 是否把同花顺主窗口/验证码弹窗移到主屏可见区(默认 False=不移动, 不打扰布局); 验证表明不移动也能正常复制/解卡
         "perf_log": True,       # 耗时监控埋点日志(节点级 [perf]); 不开发时设 false 关闭
         "verbose_log": True,    # 常规运行日志([info]/[warn]/[dbg] 等); 不开发时设 false 关闭, 降低 I/O 消耗
+        "wait_multiplier": 1.0, # 等待速度倍率: =1 原速; >1 更慢更稳(老/卡机); <1 更快(快机). 所有行为/稳健性等待都乘以此值
     }
     cfg = dict(defaults)
     try:
@@ -1240,6 +1267,25 @@ MOVE_WINDOWS = os.environ.get("EASYTRADER_MOVE_WINDOWS", str(CONFIG["move_window
 # 配置项: 耗时监控 / 运行日志开关(默认开). 环境变量可临时覆盖; 不开发时设 false 关闭以降低消耗.
 PERF_LOG = os.environ.get("EASYTRADER_PERF_LOG", str(CONFIG["perf_log"])).strip().lower() in ("1", "true", "yes", "on")
 VERBOSE_LOG = os.environ.get("EASYTRADER_VERBOSE_LOG", str(CONFIG["verbose_log"])).strip().lower() in ("1", "true", "yes", "on")
+# 配置项: 等待速度倍率(默认 1.0=原速). 环境变量 EASYTRADER_WAIT_MULTIPLIER 可临时覆盖;
+# >1 让所有等待变长(老/卡机更稳), <1 让所有等待变短(快机提速). 见 _wait().
+try:
+    WAIT_MULT = float(os.environ.get("EASYTRADER_WAIT_MULTIPLIER", str(CONFIG["wait_multiplier"])) or 1.0)
+except Exception:
+    WAIT_MULT = 1.0
+if WAIT_MULT <= 0:
+    WAIT_MULT = 1.0
+
+
+def _wait(sec):
+    """按 WAIT_MULT 缩放的 sleep. 所有"行为/稳健性等待"都走这里, 便于全局调速而不改各调用点.
+    sec 为倍率=1 时的基准秒数; 实际 sleep = sec * WAIT_MULT (>0 才睡)."""
+    try:
+        s = float(sec) * WAIT_MULT
+    except Exception:
+        s = float(sec)
+    if s > 0:
+        _t.sleep(s)
 if not VERBOSE_LOG:
     try:
         import logging as _logging
@@ -1524,15 +1570,15 @@ def _ensure_dropdown_open(app, win):
     for _ in range(4):
         try:
             win.set_focus()
-            time.sleep(0.3)
+            _wait(0.3)
             _mouse.click(coords=(rect.right - 8, rect.top + rect.height() // 2))
-            time.sleep(0.9)
+            _wait(0.9)
         except Exception:
             pass
         cl = _find_combolb(app)
         if cl:
             return cl
-        time.sleep(0.3)
+        _wait(0.3)
     return None
 
 
@@ -1556,7 +1602,7 @@ def _click_dropdown_item(app, win, idx):
         _mouse.click(coords=(x, y))
     except Exception:
         return False
-    time.sleep(1.2)
+    _wait(1.2)
     return True
 
 
@@ -1570,7 +1616,7 @@ def _close_any_popup(win):
                     try:
                         if b.class_name() == "Button" and b.window_text() in ("取消", "关闭", "确定", "OK"):
                             b.click()
-                            time.sleep(0.3)
+                            _wait(0.3)
                             closed = True
                     except Exception:
                         pass
@@ -1600,7 +1646,7 @@ def _discover_accounts():
         # 不用 user._main (可能过期), 每次重新定位主窗口
         win = _find_main_window(app) or user._main
         win.set_focus()
-        time.sleep(0.8)  # 等窗口稳定
+        _wait(0.8)  # 等窗口稳定
     except Exception:
         return []
 
@@ -1632,14 +1678,14 @@ def _discover_accounts():
     found = {}
     for i, t in enumerate(acct_texts):
         _click_dropdown_item(app, win, i)
-        time.sleep(1.3)
+        _wait(1.3)
         _close_any_popup(win)
         label = _read_account_dropdown()
         acct = _read_account_number()
         # 校验: 实际标签与预期不符时再尝试一次 (点击可能落在行间隙)
         if label != t:
             _click_dropdown_item(app, win, i)
-            time.sleep(1.3)
+            _wait(1.3)
             _close_any_popup(win)
             label = _read_account_dropdown()
             acct = _read_account_number()
@@ -1648,7 +1694,7 @@ def _discover_accounts():
     # 切回初始账户
     if initial_label and initial_label in found:
         _click_dropdown_item(app, win, found[initial_label]["hotkey"] - 1)
-        time.sleep(1.2)
+        _wait(1.2)
         _close_any_popup(win)
 
     sorted_acc = sorted(found.items(), key=lambda x: x[1]["hotkey"])
@@ -1776,12 +1822,12 @@ def switch_account():
         app = user._app
         win = _find_main_window(app) or user._main
         win.set_focus()
-        time.sleep(0.5)
+        _wait(0.5)
         ok = _click_dropdown_item(app, win, target_idx - 1)
         if not ok:
             return jsonify({"error": "failed to open/switch account dropdown"}), 500
         _close_any_popup(win)
-        time.sleep(0.8)  # 等 xiadan.exe 完成切换
+        _wait(0.8)  # 等 xiadan.exe 完成切换
     except Exception as e:
         return jsonify({"error": f"failed to switch account: {e}"}), 500
 
@@ -1837,7 +1883,7 @@ def _wrap_grid_methods(user):
                     return gs._format_grid_data(str(raw))
                 except Exception:
                     pass
-            _t.sleep(0.25)
+            _wait(0.25)
         return None
 
     def _finish(r):
