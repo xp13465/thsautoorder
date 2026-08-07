@@ -858,7 +858,7 @@ def _enter_code(dlg, code, img):
     print(f"[perf] _enter_code 填入阶段耗时={_t.time()-t_enter:.3f}s")
 
 
-def _solve_captcha(max_attempts=6, dlg=None):
+def _solve_captcha(max_attempts=None, dlg=None):
     """只要验证码弹窗在, 就一直处理: 循环 检测->截图->OCR->填入->确认->验证关闭.
     dlg: 可选, 由 _solve_if_captcha 已找到的弹窗句柄传入, 避免重复全桌面枚举(优化1).
     用户准则:
@@ -867,6 +867,8 @@ def _solve_captcha(max_attempts=6, dlg=None):
       - 有弹窗就必须处理, 直到真正关闭; 关闭即解卡成功, 调用方即可读到正确剪贴板
         (弹窗打断了复制, 解卡后同花顺自动把本次复制内容落盘, 绝不再发复制以免再次触发验证码死循环).
     返回 True 表示弹窗已关闭."""
+    if max_attempts is None:
+        max_attempts = CAPTCHA_MAX_ATTEMPTS
     from PIL import Image
     import numpy as np
     # 优化1: 优先复用调用方已找到的弹窗句柄, 仅在缺失/失效时重新枚举(省 ~200ms)
@@ -1279,6 +1281,7 @@ def load_config():
         "perf_log": True,       # 耗时监控埋点日志(节点级 [perf]); 不开发时设 false 关闭
         "verbose_log": True,    # 常规运行日志([info]/[warn]/[dbg] 等); 不开发时设 false 关闭, 降低 I/O 消耗
         "wait_multiplier": 1.0, # 等待速度倍率: =1 原速; >1 更慢更稳(老/卡机); <1 更快(快机). 所有行为/稳健性等待都乘以此值
+        "captcha_max_attempts": 20, # 验证码 OCR 解卡最大尝试次数; 同花顺输错会刷新新码, 多试几次提高认对概率(用户要求>=10~20)
     }
     cfg = dict(defaults)
     try:
@@ -1313,6 +1316,12 @@ except Exception:
     WAIT_MULT = 1.0
 # 注: WAIT_MULT=0 表示"完全不等待"——_wait(sec) 算得 s=0, 经下方 `if s>0` 直接跳过(不 sleep、不报错)。
 # 不再把 <=0 回退为 1.0, 这是用户要的极限档(纯跳过)。负数同理视为跳过(sleep 不会被传入负值)。
+# 配置项: 验证码解卡最大尝试次数(默认 20). 环境变量 EASYTRADER_CAPTCHA_MAX_ATTEMPTS 可临时覆盖;
+# 同花顺输错验证码会刷新出新的码, 多尝试几次能显著提高最终认对/解卡的概率.
+try:
+    CAPTCHA_MAX_ATTEMPTS = int(os.environ.get("EASYTRADER_CAPTCHA_MAX_ATTEMPTS", str(CONFIG["captcha_max_attempts"])) or 20)
+except Exception:
+    CAPTCHA_MAX_ATTEMPTS = 20
 
 
 def _wait(sec):
