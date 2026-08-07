@@ -1303,6 +1303,7 @@ def load_config():
         "client_startup_timeout": 60, # 启动 xiadan 后等待主窗口"股票交易"出现的最长超时(秒)
         "client_max_auto_retries": 5, # 连续自动拉起失败达此数则停止自动拉起(置 broken, 需手动 POST /xiadan/start)
         "client_watchdog_interval": 20, # 后台看门狗轮询间隔(秒)
+        "client_hide_console": True, # xiadan.exe 是 console 子系统, 守护重拉时会带一个控制台黑框; 启动后隐藏它(保留 GUI 交易窗口). 环境变量 EASYTRADER_CLIENT_HIDE_CONSOLE 可关
     }
     cfg = dict(defaults)
     try:
@@ -1365,6 +1366,10 @@ try:
     CLIENT_WATCHDOG_INTERVAL = float(os.environ.get("EASYTRADER_CLIENT_WATCHDOG_INTERVAL", CONFIG["client_watchdog_interval"]))
 except Exception:
     CLIENT_WATCHDOG_INTERVAL = 20.0
+try:
+    CLIENT_HIDE_CONSOLE = str(os.environ.get("EASYTRADER_CLIENT_HIDE_CONSOLE", str(CONFIG["client_hide_console"]))).strip().lower() in ("1", "true", "yes", "on")
+except Exception:
+    CLIENT_HIDE_CONSOLE = True
 # 守护运行时状态(供 /health 与看门狗读写)
 _RELAUNCH_LOCK = _threading.Lock()
 _xiadan_status = "unknown"      # unknown | ok | starting | recovering | broken | stopped
@@ -1735,10 +1740,52 @@ def _find_xiadan_pid():
 
 def _launch_xiadan():
     """启动 xiadan.exe (账号已保存, 会自动登录). 返回新进程 PID.
-    仅在桌面上确无 xiadan 窗口时才调用(避免单实例冲突); 正常拉起即可."""
+    仅在桌面上确无 xiadan 窗口时才调用(避免单实例冲突).
+    启动后若开启 client_hide_console, 隐藏其控制台黑框(保留 GUI 交易窗口)."""
+    before = _snapshot_console_hwnds()
     proc = subprocess.Popen([EXE_PATH])
     print(f"[info] 已启动 xiadan.exe pid={proc.pid} ({EXE_PATH})")
+    if CLIENT_HIDE_CONSOLE:
+        _hide_new_consoles(before)
     return proc.pid
+
+
+def _snapshot_console_hwnds():
+    """枚举当前所有控制台窗口的 hwnd 集合.
+    注意: Windows 新控制台(ConPTY)窗口类为 'PseudoConsoleWindow',
+    旧版为 'ConsoleWindowClass'; 两者都可能是 xiadan 的控制台黑框, 一并匹配.
+    控制台黑框拥有者是 conhost, 其窗口 pid 不是 xiadan 的 pid, 故用快照差定位."""
+    console_classes = ("ConsoleWindowClass", "PseudoConsoleWindow")
+    s = set()
+    def _enum(hwnd, _):
+        try:
+            if win32gui.GetClassName(hwnd) in console_classes:
+                s.add(hwnd)
+        except Exception:
+            pass
+    try:
+        win32gui.EnumWindows(_enum, None)
+    except Exception:
+        pass
+    return s
+
+
+def _hide_new_consoles(before):
+    """隐藏'本次启动后新出现的控制台窗口'(即 xiadan 的控制台黑框).
+    控制台黑框的拥有者是 conhost, 其窗口 pid 不是 xiadan 的 pid, 故用快照差定位,
+    避免依赖 pid 映射. 隐藏后只留 GUI 交易窗口, 不影响 pywinauto 连接."""
+    deadline = _t.time() + 5.0
+    while _t.time() < deadline:
+        new = _snapshot_console_hwnds() - before
+        if new:
+            for hwnd in new:
+                try:
+                    win32gui.ShowWindow(hwnd, win32con.SW_HIDE)
+                except Exception:
+                    pass
+            return
+        _t.sleep(0.15)
+    # 超时未找到新控制台窗口: 不强求, 黑框保留也不致命(仅为外观)
 
 
 def _wait_for_main_window(pid, timeout):
