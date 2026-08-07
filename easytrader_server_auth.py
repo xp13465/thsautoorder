@@ -2040,8 +2040,19 @@ def _xiadan_alive():
 
 def _xiadan_window_up():
     """客户端窗口是否已出现在桌面(交易主窗口或登录对话框), 不依赖本服务是否已连接(user).
-    用于冷启动拉起后判断'进程已起', 以及操作前探活(避免在无 user 时误判死亡而反复拉起)."""
-    return _find_xiadan_window()[0] is not None or _is_login_dialog_open()
+    用于冷启动拉起后判断'进程已起', 以及操作前探活(避免在无 user 时误判死亡而反复拉起).
+
+    重要: win32gui.EnumWindows / pywinauto.Desktop().windows() 只能枚举"本进程所在桌面会话"
+    的窗口. 当本服务与用户桌面(Console 1)不在同一会话(例如服务以 Session 0 / 后台方式运行)
+    时, 这些窗口枚举调用会枚举不到用户桌面上的 xiadan, 从而误判"客户端已死"并反复拉起新实例.
+    因此增加"进程名(tasklist 全局可见, 不受会话限制)兜底": 只要系统里仍有 xiadan.exe 进程在跑,
+    就视为客户端还在, 不再重复拉起."""
+    if _find_xiadan_window()[0] is not None:
+        return True
+    if _is_login_dialog_open():
+        return True
+    # 兜底: 跨会话 / 窗口暂时不可枚举时, 只要仍有 xiadan.exe 进程即视为活着, 避免反复误拉起
+    return _xiadan_process_exists()
 
 
 def _wait_for_client_window(pid, timeout):
@@ -2229,8 +2240,10 @@ def _ensure_xiadan(force=False):
                 return True
             except Exception as e:
                 print(f"[warn] 复用现有 xiadan 进程失败: {e}")
-                # 窗口还在但重连失败 -> 不急着拉起(单实例, 拉起无用), 等下次重试
-                if hwnd:
+                # 窗口/进程还在但重连失败 -> 不急着拉起(单实例, 拉起无用), 等下次重试.
+                # 注意: 跨会话时 _find_xiadan_window 返回的 hwnd 为 None(枚举不到), 但 existing(进程名兜底)
+                # 仍可能是真实 pid, 此时也应视为"仍在"而停止继续往下走到 _launch_xiadan 拉新实例.
+                if hwnd or existing:
                     _xiadan_status = "recovering"
                     return False
         # 2) 桌面上没有任何 xiadan 窗口 -> 才启动新进程(受最大重试与冷却约束)
