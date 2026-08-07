@@ -26,6 +26,7 @@ import easytrader.api as _et_api
 from easytrader.clienttrader import ClientTrader
 
 import ctypes
+import subprocess
 import sys
 import win32gui
 import win32con
@@ -244,6 +245,12 @@ def _start_worker():
         _WORKER.start()
     # 启动期预热进程内 EasyOCR(torch 仅加载一次, 已预热), 之后解卡秒级(复刻"昨晚版")
     _get_ocr_reader()
+    # 客户端守护: 启动后台看门狗线程(兼作"开机自启"——服务起来后自动把 xiadan 拉起/恢复)
+    global _xiadan_watchdog_thread
+    if CLIENT_GUARDIAN and _xiadan_watchdog_thread is None:
+        _xiadan_watchdog_thread = _threading.Thread(target=_xiadan_watchdog, name="xiadan-watchdog", daemon=True)
+        _xiadan_watchdog_thread.start()
+        print("[info] 已启动 xiadan 客户端守护看门狗线程(间隔 %.0fs)" % CLIENT_WATCHDOG_INTERVAL)
 
 
 def _gui_call(fn, *, priority, refresh=False, name="gui_call", perf=None):
@@ -289,11 +296,20 @@ def _gui_call(fn, *, priority, refresh=False, name="gui_call", perf=None):
                 dt_captcha_pre = _t.time() - t_cap
                 if perf:
                     perf.mark("captcha_pre_done")
+            # 客户端守护: 操作前 best-effort 探活, 客户端崩了先恢复(透明自愈)
+            if CLIENT_GUARDIAN and not _xiadan_alive():
+                _ensure_xiadan()
             t_fn = _t.time()
             if perf:
                 perf.mark("fn_start")
             try:
                 result = fn()
+            except Exception:
+                # 操作中抛异常且客户端确已死 -> 恢复后重试一次(让"正好撞上崩溃的那次请求"也成功)
+                if CLIENT_GUARDIAN and not _xiadan_alive() and _ensure_xiadan():
+                    result = fn()
+                else:
+                    raise
             finally:
                 if perf:
                     perf.mark("fn_done")
@@ -1282,6 +1298,11 @@ def load_config():
         "verbose_log": True,    # 常规运行日志([info]/[warn]/[dbg] 等); 不开发时设 false 关闭, 降低 I/O 消耗
         "wait_multiplier": 1.0, # 等待速度倍率: =1 原速; >1 更慢更稳(老/卡机); <1 更快(快机). 所有行为/稳健性等待都乘以此值
         "captcha_max_attempts": 20, # 验证码 OCR 解卡最大尝试次数; 同花顺输错会刷新新码, 多试几次提高认对概率(用户要求>=10~20)
+        "client_guardian": true, # 客户端守护: 自动看护同花顺 xiadan.exe(崩溃自愈+开机自启). 环境变量 EASYTRADER_CLIENT_GUARDIAN 可关
+        "client_relaunch_cooldown": 30, # 两次自动拉起最小间隔(秒), 防抖动
+        "client_startup_timeout": 60, # 启动 xiadan 后等待主窗口"股票交易"出现的最长超时(秒)
+        "client_max_auto_retries": 5, # 连续自动拉起失败达此数则停止自动拉起(置 broken, 需手动 POST /xiadan/start)
+        "client_watchdog_interval": 20, # 后台看门狗轮询间隔(秒)
     }
     cfg = dict(defaults)
     try:
@@ -1322,6 +1343,35 @@ try:
     CAPTCHA_MAX_ATTEMPTS = int(os.environ.get("EASYTRADER_CAPTCHA_MAX_ATTEMPTS", str(CONFIG["captcha_max_attempts"])) or 20)
 except Exception:
     CAPTCHA_MAX_ATTEMPTS = 20
+
+# ==================== 客户端守护(同花顺 xiadan.exe)配置/运行时状态 ====================
+try:
+    CLIENT_GUARDIAN = str(os.environ.get("EASYTRADER_CLIENT_GUARDIAN", str(CONFIG["client_guardian"]))).strip().lower() in ("1", "true", "yes", "on")
+except Exception:
+    CLIENT_GUARDIAN = True
+try:
+    CLIENT_RELAUNCH_COOLDOWN = float(os.environ.get("EASYTRADER_CLIENT_RELAUNCH_COOLDOWN", CONFIG["client_relaunch_cooldown"]))
+except Exception:
+    CLIENT_RELAUNCH_COOLDOWN = 30.0
+try:
+    CLIENT_STARTUP_TIMEOUT = float(os.environ.get("EASYTRADER_CLIENT_STARTUP_TIMEOUT", CONFIG["client_startup_timeout"]))
+except Exception:
+    CLIENT_STARTUP_TIMEOUT = 60.0
+try:
+    CLIENT_MAX_AUTO_RETRIES = int(os.environ.get("EASYTRADER_CLIENT_MAX_AUTO_RETRIES", CONFIG["client_max_auto_retries"]))
+except Exception:
+    CLIENT_MAX_AUTO_RETRIES = 5
+try:
+    CLIENT_WATCHDOG_INTERVAL = float(os.environ.get("EASYTRADER_CLIENT_WATCHDOG_INTERVAL", CONFIG["client_watchdog_interval"]))
+except Exception:
+    CLIENT_WATCHDOG_INTERVAL = 20.0
+# 守护运行时状态(供 /health 与看门狗读写)
+_RELAUNCH_LOCK = _threading.Lock()
+_xiadan_status = "unknown"      # unknown | ok | starting | recovering | broken | stopped
+_xiadan_pid = None
+_xiadan_watchdog_thread = None
+_last_relaunch_ts = 0.0
+_auto_retry_count = 0
 
 
 def _wait(sec):
@@ -1404,10 +1454,45 @@ def health():
         "active_account": global_store.get("active_account_number"),
         "port": PORT,
         "ocr_ready": bool(_OCR_READY),
+        # 客户端守护状态
+        "xiadan_alive": _xiadan_alive(),
+        "xiadan_status": _xiadan_status,
+        "xiadan_pid": _xiadan_pid,
         # EasyOCR 现为【进程内】常驻: torch/Reader 在启动期由 _get_ocr_reader() 加载一次并预热,
         # ocr_ready=True 表示进程内识别器已就绪(验证码解卡走进程内亚秒级推理, 复刻"昨晚版"速度);
         # 若启动期 torch 加载失败, _OCR_READY=False, _ocr_readtext_subprocess 返回 None, 验证码走人工降级, 不影响查询.
     })
+
+
+@app.route("/xiadan/start", methods=["POST"])
+def xiadan_start():
+    """手动/远端拉起 xiadan 客户端(崩溃恢复 / 开机自启 / 自动恢复冷却中时可用).
+    若已有进程则复用重连, 否则启动新进程连接. ?force=1 强制重连."""
+    force = request.args.get("force") in ("1", "true", "yes")
+    ok = _ensure_xiadan(force=force)
+    return jsonify({
+        "ok": bool(ok),
+        "xiadan_alive": _xiadan_alive(),
+        "xiadan_status": _xiadan_status,
+        "xiadan_pid": _xiadan_pid,
+    }), (200 if ok else 502)
+
+
+@app.route("/xiadan/stop", methods=["POST"])
+def xiadan_stop():
+    """优雅退出 xiadan 客户端(维护用). 守护开启时下次操作/看门狗会把它重新拉起."""
+    user = global_store.get("user")
+    pid = _xiadan_pid
+    try:
+        if user is not None:
+            try:
+                user.exit()
+            except Exception:
+                pass
+    except Exception:
+        pass
+    _xiadan_status = "stopped"
+    return jsonify({"ok": True, "msg": "xiadan exit requested", "xiadan_pid": pid}), 200
 
 
 # ==================== 多账户管理 (同花顺 xiadan.exe 单进程多账户) ====================
@@ -1569,6 +1654,278 @@ def _refresh_user_window(user):
     except Exception:
         pass
 
+
+
+# ==================== 客户端守护 (同花顺 xiadan.exe) ====================
+# 目标: xiadan 崩溃/未启动时, 服务能自动拉起并恢复连接, 对调用方透明.
+# 设计: 存活检测 + 恢复函数(复用现有进程 / 启动新进程 + 重连 + 重跑 prepare + 重切账户)
+#       + 自愈挂载点(每次 GUI 操作前 best-effort 检查, 死了先恢复; 操作抛死窗异常则恢复后重试一次)
+#       + 后台看门狗线程(提前恢复) + API 控制面(/xiadan/start|stop) + /health 暴露状态.
+# 复用既有函数, 不重写任何验证码检测/填入代码.
+
+def _pid_alive(pid):
+    """进程是否存活(Windows 下 os.kill(pid,0) 探测)."""
+    try:
+        os.kill(pid, 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True  # 进程存在但无权限信号, 仍算存活
+    except Exception:
+        return False
+
+
+def _find_xiadan_pid():
+    """扫描是否有 xiadan.exe 进程在跑, 返回其 PID 或 None (不依赖本服务是否已连接)."""
+    try:
+        out = subprocess.run(
+            ["tasklist", "/fi", "IMAGENAME eq xiadan.exe", "/fo", "csv", "/nh"],
+            capture_output=True, text=True,
+        ).stdout
+        for line in out.splitlines():
+            parts = [p.strip().strip('"') for p in line.split(",")]
+            if len(parts) >= 2 and parts[0].lower() == "xiadan.exe":
+                try:
+                    return int(parts[1])
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    return None
+
+
+def _launch_xiadan():
+    """启动 xiadan.exe (账号已保存, 会自动登录). 返回新进程 PID."""
+    proc = subprocess.Popen([EXE_PATH], creationflags=0x08000000)  # CREATE_NO_WINDOW
+    print(f"[info] 已启动 xiadan.exe pid={proc.pid} ({EXE_PATH})")
+    return proc.pid
+
+
+def _wait_for_main_window(pid, timeout):
+    """等待 xiadan 主窗口(标题含'股票交易')出现且有效. 自动登录 5~20s, 超时返回 False."""
+    deadline = _t.time() + timeout
+    while _t.time() < deadline:
+        try:
+            app = pywinauto.Application().connect(process=pid, timeout=2)
+            main = _find_main_window(app)
+            if main is not None and win32gui.IsWindow(main.handle):
+                return True
+        except Exception:
+            pass
+        _t.sleep(1)
+    return False
+
+
+def _xiadan_alive():
+    """本服务当前连接的 xiadan 客户端是否存活(进程在 + 主窗口可达)."""
+    u = global_store.get("user")
+    if u is None or not getattr(u, "_app", None):
+        return False
+    try:
+        pid = u._app.process
+        if not _pid_alive(pid):
+            return False
+        main = _find_main_window(u._app)
+        if main is None:
+            return False
+        return bool(win32gui.IsWindow(main.handle))
+    except Exception:
+        return False
+
+
+def _switch_account_core(target_idx):
+    """切换账户核心(被 /switch 与守护恢复共用). target_idx 为 hotkey(1-based).
+    返回 (previous_label, actual_label, actual_account). 失败时抛异常."""
+    user = global_store["user"]
+    previous = global_store.get("active_account")
+    app = user._app
+    win = _find_main_window(app) or user._main
+    try:
+        win.set_keyboard_focus()
+    except Exception:
+        pass
+    _wait(0.5)
+    ok = _click_dropdown_item(app, win, target_idx - 1)
+    if not ok:
+        raise RuntimeError("open/switch dropdown failed")
+    _close_any_popup(win)
+    _wait(0.8)
+    info = _read_account_info()
+    actual = info["label"]
+    actual_acct = info["account"]
+    global_store["active_account"] = actual
+    global_store["active_account_number"] = actual_acct
+    global_store["_last_active_account_number"] = actual_acct
+    global_store["_last_active_hotkey"] = target_idx
+    return previous, actual, actual_acct
+
+
+def _reapply_active_account():
+    """恢复连接后, 把之前活跃账户重新切回去(同花顺会记住上次账户, 但显式切更稳)."""
+    acct = global_store.get("_last_active_account_number")
+    if not acct:
+        return
+    if global_store.get("active_account_number") == acct:
+        return
+    hotkey = global_store.get("_last_active_hotkey")
+    if not hotkey:
+        for a in global_store.get("accounts", []):
+            if a.get("account") == acct:
+                hotkey = a.get("hotkey")
+                break
+    if not hotkey:
+        return
+    try:
+        _switch_account_core(hotkey)
+        print(f"[info] 恢复连接后已重切账户: {acct} (hotkey={hotkey})")
+    except Exception as e:
+        print(f"[warn] 恢复连接后重切账户失败(忽略, 使用默认登录账户): {e}")
+
+
+def _do_prepare(user, *, broker=None, label="main", exe_path=None, pid=None, grid_strategy=None):
+    """连接 + 后置初始化(被 /prepare 与守护恢复共用). 不依赖 request 上下文."""
+    from easytrader import grid_strategies
+    _patch_copy_get()  # 幂等(内部 _robust_patched 守卫), /prepare 与恢复都确保打过补丁
+    strategy = (grid_strategy or CONFIG.get("grid_strategy") or "copy").lower()
+    if strategy == "xls":
+        # 在官方 Xls 策略基础上包一层: 每次读取完临时 xls 后立即删除, 避免堆积.
+        class XlsAutoClean(grid_strategies.Xls):
+            def _format_grid_data(self, data):
+                try:
+                    return super()._format_grid_data(data)
+                finally:
+                    _rmfile(data)
+
+        user.grid_strategy = XlsAutoClean
+        _xls_tmp = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ths_grid_tmp")
+        os.makedirs(_xls_tmp, exist_ok=True)
+        for _f in os.listdir(_xls_tmp):
+            if _f.lower().endswith((".xls", ".xlsx")):
+                _rmfile(os.path.join(_xls_tmp, _f))
+        user.grid_strategy_instance.tmp_folder = _xls_tmp
+        print("[info] Grid 策略=Xls (Ctrl+S 另存, 仅降频验证码)")
+    else:
+        # 默认 Copy: 显式置回原生策略, 避免任何残留 Xls 实例污染.
+        user.grid_strategy = grid_strategies.Copy
+        print("[info] Grid 策略=Copy (原生剪贴板, 验证码由自动解卡覆盖)")
+    kwargs = {}
+    if pid:
+        kwargs["pid"] = pid
+    if exe_path:
+        kwargs["exe_path"] = exe_path
+    user.prepare(**kwargs)
+    global_store["user"] = user
+    _wrap_grid_methods(user)
+    # 登录仅做连接校验, 不枚举/切换账户 (账户发现交给显式 POST /accounts/refresh).
+    global_store["active_account"] = None
+    global_store["active_account_number"] = None
+    global_store["accounts"] = []
+    try:
+        info = _read_account_info()  # 只读当前账户, 不切换
+        if info["label"]:
+            global_store["active_account"] = info["label"]
+            global_store["active_account_number"] = info["account"]
+            # 仅登记当前账户 (hotkey=0), 完整多账户列表由 /accounts/refresh 填充
+            global_store["accounts"] = [{"label": info["label"], "hotkey": 0, "account": info["account"]}]
+            global_store["_last_active_account_number"] = info["account"]
+            global_store["_last_active_hotkey"] = 0
+    except Exception:
+        pass
+    if broker:
+        global_store["_last_broker"] = broker
+    global_store["_last_label"] = label
+    global_store["_last_exe_path"] = exe_path or EXE_PATH
+    global_store["_last_grid_strategy"] = strategy
+    return user
+
+
+def _reconnect_to(pid):
+    """用现有/新建的 ClientTrader 连接到给定 pid 的 xiadan, 重跑 prepare + 重切账户."""
+    user = global_store.get("user")
+    broker = global_store.get("_last_broker") or "ths"
+    if user is None:
+        user = _et_api.use(broker)
+    _do_prepare(
+        user,
+        broker=broker,
+        label=global_store.get("_last_label", "main"),
+        pid=pid,
+        grid_strategy=global_store.get("_last_grid_strategy"),
+    )
+    _reapply_active_account()
+
+
+def _ensure_xiadan(force=False):
+    """确保 xiadan 客户端存活且已连接. 返回 True=已恢复/本来就好; False=恢复失败.
+    自动守护与 API(/xiadan/start)共用. 内部加锁防并发重入."""
+    global _xiadan_status, _xiadan_pid, _last_relaunch_ts, _auto_retry_count
+    with _RELAUNCH_LOCK:
+        # 已连接且存活 -> OK(除非 force 强制重连)
+        if _xiadan_alive() and not force:
+            _xiadan_status = "ok"
+            _u = global_store.get("user")
+            _xiadan_pid = _u._app.process if _u and getattr(_u, "_app", None) else _xiadan_pid
+            return True
+        # 1) 已有 xiadan 进程在跑(可能本服务失联) -> 复用, 不新开(避免多实例)
+        existing = _find_xiadan_pid()
+        if existing and existing != _xiadan_pid:
+            try:
+                _reconnect_to(existing)
+                _xiadan_status = "ok"
+                _xiadan_pid = existing
+                _auto_retry_count = 0
+                print(f"[info] 复用现有 xiadan 进程 pid={existing} 重连成功")
+                return True
+            except Exception as e:
+                print(f"[warn] 复用现有 xiadan 进程失败: {e}")
+        # 2) 没进程 -> 启动新进程(受最大重试与冷却约束)
+        if not force and _auto_retry_count >= CLIENT_MAX_AUTO_RETRIES:
+            _xiadan_status = "broken"
+            print(f"[warn] xiadan 连续自动拉起失败达上限({CLIENT_MAX_AUTO_RETRIES}), 停止自动拉起, 需手动 POST /xiadan/start")
+            return False
+        # 冷却: 连续失败后要等冷却期(CLIENT_RELAUNCH_COOLDOWN)才再次自动拉起, 避免抖动式反复启动
+        if not force and _auto_retry_count > 0 and (_t.time() - _last_relaunch_ts) < CLIENT_RELAUNCH_COOLDOWN:
+            _xiadan_status = "recovering"
+            return False
+        try:
+            _xiadan_status = "starting"
+            new_pid = _launch_xiadan()
+            if not _wait_for_main_window(new_pid, CLIENT_STARTUP_TIMEOUT):
+                raise RuntimeError("启动后超时未出现主窗口(股票交易)")
+            _reconnect_to(new_pid)
+            _xiadan_status = "ok"
+            _xiadan_pid = new_pid
+            _auto_retry_count = 0
+            _last_relaunch_ts = _t.time()
+            print(f"[info] xiadan 已启动并连接 pid={new_pid}")
+            return True
+        except Exception as e:
+            print(f"[warn] 启动/连接 xiadan 失败: {e}")
+            _auto_retry_count += 1
+            _last_relaunch_ts = _t.time()
+            _xiadan_status = "broken" if _auto_retry_count >= CLIENT_MAX_AUTO_RETRIES else "recovering"
+            return False
+
+
+def _xiadan_watchdog():
+    """后台看门狗: 定期探活, 客户端死了且工作线程空闲时自动恢复(兼作开机自启)."""
+    first = True
+    while True:
+        if not first:
+            _t.sleep(CLIENT_WATCHDOG_INTERVAL)
+        first = False
+        if not CLIENT_GUARDIAN:
+            continue
+        try:
+            if _RELAUNCH_LOCK.locked():
+                continue
+            if _WORKER_BUSY.is_set():
+                continue  # 不打断在途 GUI 操作, 交给下次自愈
+            if not _xiadan_alive():
+                _ensure_xiadan()
+        except Exception as e:
+            print(f"[warn] 看门狗异常: {e}")
 
 
 # ==================== ComboBox 下拉切换 (替代 Alt+N, 兼容性更好) ====================
@@ -1809,6 +2166,8 @@ def refresh_accounts():
     if current:
         global_store["active_account"] = current
         global_store["active_account_number"] = current_acct
+        global_store["_last_active_account_number"] = current_acct
+        global_store["_last_active_hotkey"] = next((a["hotkey"] for a in accounts if a["account"] == current_acct), 0)
         if not any(a["label"] == current for a in accounts):
             accounts.insert(0, {"label": current, "hotkey": 0, "account": current_acct})
 
@@ -1882,30 +2241,10 @@ def switch_account():
 
     # 通过下拉列表坐标点击切换 (替代失效的 Alt+N)
     # target_idx 是 hotkey (1-based), 对应下拉第 (target_idx-1) 项
-    user = global_store["user"]
     try:
-        app = user._app
-        win = _find_main_window(app) or user._main
-        try:
-            win.set_keyboard_focus()   # 仅设键盘焦点, 不甩鼠标(替代 win.set_focus)
-        except Exception:
-            pass
-        _wait(0.5)
-        ok = _click_dropdown_item(app, win, target_idx - 1)
-        if not ok:
-            return jsonify({"error": "failed to open/switch account dropdown"}), 500
-        _close_any_popup(win)
-        _wait(0.8)  # 等 xiadan.exe 完成切换
+        previous, actual, actual_acct = _switch_account_core(target_idx)
     except Exception as e:
         return jsonify({"error": f"failed to switch account: {e}"}), 500
-
-    # 验证切换结果
-    info = _read_account_info()
-    actual = info["label"]
-    actual_acct = info["account"]
-    previous = global_store.get("active_account")
-    global_store["active_account"] = actual
-    global_store["active_account_number"] = actual_acct
 
     if actual != target_label:
         return jsonify({
@@ -2046,26 +2385,9 @@ def _enhanced_prepare():
         user.grid_strategy = grid_strategies.Copy
         print("[info] Grid 策略=Copy (原生剪贴板, 验证码由自动解卡覆盖)")
     # json_data 里剩余: exe_path / pid (patched connect 优先用 pid) / user / password 等
-    user.prepare(**json_data)
+    _do_prepare(user, broker=broker, label=label, exe_path=json_data.get("exe_path"), pid=json_data.get("pid"))
 
-    global_store["user"] = user
-    # 包一层网格查询方法, 覆盖"复制过程中才弹验证码"的时序
-    _wrap_grid_methods(user)
-
-    # 登录仅做连接校验, 不枚举/切换账户 (账户发现交给显式 POST /accounts/refresh).
-    # 只读当前账户信息 (不切换、不逐个遍历), 耗时仅一次 ComboBox 文本读取.
-    global_store["active_account"] = None
-    global_store["active_account_number"] = None
-    global_store["accounts"] = []
-    try:
-        info = _read_account_info()  # 只读当前账户, 不切换
-        if info["label"]:
-            global_store["active_account"] = info["label"]
-            global_store["active_account_number"] = info["account"]
-            # 仅登记当前账户 (hotkey=0), 完整多账户列表由 /accounts/refresh 填充
-            global_store["accounts"] = [{"label": info["label"], "hotkey": 0, "account": info["account"]}]
-    except Exception:
-        pass
+    # 连接/账户初始化已由 _do_prepare 完成(上方 strategy 选择块为兼容保留, 实际逻辑统一在 _do_prepare)
 
     return jsonify({
         "msg": "login success",
