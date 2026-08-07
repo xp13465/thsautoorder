@@ -95,7 +95,7 @@ import queue as _queue
 import time as _t
 
 MODE = "queue"            # "queue"=排队消费返回结果; "reject"=旧行为(查询过于频繁直接429)
-_QUEUE_TIMEOUT = 30.0     # 单请求在队列中最多等待秒数
+_QUEUE_TIMEOUT = float(os.environ.get("EASYTRADER_QUEUE_TIMEOUT", "120.0"))  # 单请求在队列中最多等待秒数; 冷启动拉起+等登录可能耗时, 放大到 120s 避免票据在客户端就绪前过期
 _ORDER_PRIORITY = 0       # 订单/撤单/打新(改变状态, 优先)
 _QUERY_PRIORITY = 1       # 只读查询(次之)
 
@@ -275,13 +275,15 @@ def _gui_call(fn, *, priority, refresh=False, name="gui_call", perf=None):
             perf.mark("body_run")
             _CUR_PERF = perf
         try:
-            # 1) 冷启动: 客户端未连接(user 为空)时, 守护先拉起客户端. 只等进程/窗口起来(不要求已登录),
-            #    连接(user.prepare)需交易主窗口, 故延后到下方确认登录后再做. 失败(进程都起不来)才真未连接.
-            u = global_store.get("user")
-            if u is None:
-                if CLIENT_GUARDIAN and _ensure_xiadan():
-                    u = global_store.get("user")  # 热路径(已有窗口且已登录)立即拿到; 冷启动仍为 None
-                if u is None and not _xiadan_window_up():
+            # 1) 客户端窗口根本不在桌面(已死/未起) -> 无论是否已连接(user 是否为空)都先拉起.
+            #    这是"杀进程后请求自愈"的关键: 只要检测到桌面上没有 xiadan 窗口, 就立即拉起,
+            #    不等看门狗(看门狗仅在 worker 空闲时每 CLIENT_WATCHDOG_INTERVAL 秒动作一次).
+            #    拉起失败(进程都起不来)才算真未连接. 拉起后客户端可能在登录界面(窗口已起但不算"已登录"),
+            #    连接(user.prepare)需交易主窗口, 故延后到步骤3确认登录后再做.
+            if CLIENT_GUARDIAN and not _xiadan_window_up():
+                if not _ensure_xiadan():
+                    raise RuntimeError("交易客户端未连接(自动拉起失败)")
+                if not _xiadan_window_up():
                     raise RuntimeError("交易客户端未连接(自动拉起失败)")
             # 2) 等登录: 交易主窗口就绪且登录对话框已关闭才放查询进来. 停留在登录界面
             #    (自动登录未完成/需人工) -> 最多等 CLIENT_LOGIN_WAIT_TIMEOUT 秒, 超时返回 423 需人工参与.
@@ -297,6 +299,7 @@ def _gui_call(fn, *, priority, refresh=False, name="gui_call", perf=None):
                     u = global_store.get("user")
                 if u is None:
                     raise RuntimeError("交易客户端未连接(prepare 未完成)")
+                _xiadan_status = "ok"
             t_refresh = _t.time()
             if refresh:
                 try:
@@ -1488,6 +1491,7 @@ _RELAUNCH_LOCK = _threading.Lock()
 _xiadan_status = "unknown"      # unknown | ok | starting | recovering | broken | stopped
 _xiadan_pid = None
 _xiadan_watchdog_thread = None
+_watchdog_last_run = 0.0  # 看门狗最后一次巡检时间戳(用于 /health 诊断线程是否存活)
 _last_relaunch_ts = 0.0
 _auto_retry_count = 0
 
@@ -1574,10 +1578,14 @@ def health():
         "ocr_ready": bool(_OCR_READY),
         # 客户端守护状态
         "xiadan_alive": _xiadan_alive(),
+        "xiadan_window_up": _xiadan_window_up(),  # 窗口(主窗口或登录对话框)是否已出现在桌面; 看门狗/API 拉起后此即变 True, 不依赖是否已登录/连接
         "xiadan_logged_in": _is_logged_in(),
         # 缓存状态可能在一次失败尝试后停留为 recovering/broken; 若实时探活已就绪则覆盖为 ok, 避免误报
         "xiadan_status": (_xiadan_status if not (_xiadan_alive() and _is_logged_in()) else "ok"),
         "xiadan_pid": _xiadan_pid,
+        # 看门狗诊断: alive=线程是否还活着; last_run=距上次巡检秒数(若长时间不更新说明线程卡死)
+        "watchdog_alive": bool(_xiadan_watchdog_thread and _xiadan_watchdog_thread.is_alive()),
+        "watchdog_last_run_ago": (round(_t.time() - _watchdog_last_run, 1) if _watchdog_last_run else None),
         # EasyOCR 现为【进程内】常驻: torch/Reader 在启动期由 _get_ocr_reader() 加载一次并预热,
         # ocr_ready=True 表示进程内识别器已就绪(验证码解卡走进程内亚秒级推理, 复刻"昨晚版"速度);
         # 若启动期 torch 加载失败, _OCR_READY=False, _ocr_readtext_subprocess 返回 None, 验证码走人工降级, 不影响查询.
@@ -2222,7 +2230,8 @@ def _ensure_xiadan(force=False):
 
 
 def _xiadan_watchdog():
-    """后台看门狗: 定期探活, 客户端死了且工作线程空闲时自动恢复(兼作开机自启)."""
+    """后台看门狗: 定期探活, 客户端窗口不在桌面且工作线程空闲时自动恢复(兼作开机自启)."""
+    global _watchdog_last_run
     first = True
     while True:
         if not first:
@@ -2231,11 +2240,14 @@ def _xiadan_watchdog():
         if not CLIENT_GUARDIAN:
             continue
         try:
+            _watchdog_last_run = _t.time()
             if _RELAUNCH_LOCK.locked():
                 continue
             if _WORKER_BUSY.is_set():
-                continue  # 不打断在途 GUI 操作, 交给下次自愈
-            if not _xiadan_alive():
+                continue  # 不打断在途 GUI 操作, 交给请求路径自身拉起
+            # 用"窗口是否出现"判死(而非 _xiadan_alive, 后者还要求已连接 user):
+            # 客户端停在登录界面时窗口已起, 不应重拉; 只有窗口彻底消失(被杀死)才拉起.
+            if not _xiadan_window_up():
                 _ensure_xiadan()
         except Exception as e:
             print(f"[warn] 看门狗异常: {e}")
