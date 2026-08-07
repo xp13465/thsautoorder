@@ -15,6 +15,10 @@ easytrader 增强版服务端 - Token 鉴权 + 内置测试面板 + 健康检查
 """
 
 import os
+# 防止 torch 加载期 OpenMP 多线程竞态导致 Access Violation 崩溃(本机 pythoncore-3.14-64 + torch CPU 偶发/偶粘):
+# 必须在 import torch 之前固定单线程 OpenMP, 否则服务一启动就崩。torch 为懒加载(在 _get_ocr_reader 内), 此处设置已足够早。
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 import re
 import json
 import time
