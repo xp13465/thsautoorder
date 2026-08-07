@@ -723,12 +723,11 @@ def _locate_by_text(img, keywords):
 def _enter_code(dlg, code, img):
     """填入验证码并确认.
     关键实现点:
-    - 同花顺验证码编辑框不响应 WM_SETTEXT/WM_CHAR, 只能用真实键盘键击.
-    - 本 server 是后台进程, 必须先把【本线程挂到弹窗所属线程】(cur_tid -> dlg_tid),
-      再 SetForegroundWindow/SetFocus, 否则 SendInput/keybd_event 的键击会打到别的窗口.
-    - 弹窗若位于副屏/离屏坐标, SetForegroundWindow 即便 SPI 关闭前台锁也可能无法真正激活;
-      故先把弹窗移到主屏可见区, 解决后再恢复? 这里直接移入主屏(100,100), 保证键击落盘.
-    - 键入使用 win32api.keybd_event(底层 SendInput 等价), 比 pywinauto.keyboard 更可控."""
+    - 同花顺验证码编辑框【实测 WM_CHAR 有效】(诊断验证 focus==eh 时 PostMessage WM_CHAR 即插入字符);
+      仅 WM_SETTEXT 无效, 故清空用 EM_SETSEL+WM_CLEAR, 输入用 PostMessage WM_CHAR(均消息化, 不依赖键盘模拟).
+    - 设前台/设焦点仍走 win32(SetForegroundWindow+SetFocus, 已 patch 前台锁), 保障消息落到正确控件.
+    - 提交用 SendMessage(bh, BM_CLICK) 点"确定"按钮(消息化); keybd_event 回车仅作回退.
+    - 弹窗若位于副屏/离屏坐标, 仍先移入主屏(100,100) 保证可见与消息投递可靠."""
     import win32gui, win32con, win32api, win32process
     t_enter = _t.time()
     _perf_mark("enter_start")
@@ -834,10 +833,15 @@ def _enter_code(dlg, code, img):
             win32api.keybd_event(0x2E, 0, 0, 0); win32api.keybd_event(0x2E, 0, win32con.KEYEVENTF_KEYUP, 0); _wait_crit(0.04)
         keybd_send(code)  # 输入正确码; 字符间隔用 _wait(可缩放, 非正确性关键)
         _t.sleep(max(0.05 * WAIT_MULT, 0.04))  # 输入后保底(原 _wait(0.08))
-        # 提交: 回车(保底等待, 提交关键)
-        win32api.keybd_event(0x0D, 0, 0, 0)
-        _wait_crit(0.03)  # 保底(原 _wait(0.04))
-        win32api.keybd_event(0x0D, 0, win32con.KEYEVENTF_KEYUP, 0)
+        # 提交: 直接给"确定/确认"按钮发 BM_CLICK(消息化, 不依赖键盘/前台锁, 比 keybd_event 回车可靠).
+        # 已废弃的 keybd_event(回车)仅作回退. 回退方式: 把下面 try 段整体改回 win32api.keybd_event(0x0D).
+        try:
+            win32gui.SendMessage(bh, win32con.BM_CLICK, 0, 0)
+        except Exception as e:
+            print("[warn] BM_CLICK 提交失败(回退 keybd_event 回车):", e)
+            win32api.keybd_event(0x0D, 0, 0, 0)
+            _wait_crit(0.03)
+            win32api.keybd_event(0x0D, 0, win32con.KEYEVENTF_KEYUP, 0)
         _t.sleep(max(0.18 * WAIT_MULT, 0.10))  # 等关闭保底(原 _wait(0.35))
         if _dialog_still_open(dlg):
             try:
@@ -1584,15 +1588,24 @@ def _ensure_dropdown_open(app, win):
     cb = _find_combo2322(win)
     if not cb:
         return None
+    cb_hwnd = int(cb.handle)
     rect = cb.rectangle()
+    _CB_SHOWDROPDOWN = getattr(win32con, 'CB_SHOWDROPDOWN', 0x14F)
     for _ in range(4):
         try:
-            win.set_focus()
-            _wait(0.3)
-            _mouse.click(coords=(rect.right - 8, rect.top + rect.height() // 2))
-            _wait(0.9)
+            win.set_keyboard_focus()   # 仅设键盘焦点, 不甩鼠标(替代 win.set_focus)
         except Exception:
             pass
+        try:
+            # 消息化打开下拉: SendMessage(CB_SHOWDROPDOWN,1) 不移动/点击鼠标, 比 _mouse.click 箭头更稳
+            win32gui.SendMessage(cb_hwnd, _CB_SHOWDROPDOWN, 1, 0)
+        except Exception as e:
+            print("[warn] CB_SHOWDROPDOWN 失败(回退 _mouse.click 箭头):", e)
+            try:
+                _mouse.click(coords=(rect.right - 8, rect.top + rect.height() // 2))
+            except Exception:
+                pass
+        _wait(0.9)
         cl = _find_combolb(app)
         if cl:
             return cl
@@ -1633,7 +1646,13 @@ def _close_any_popup(win):
                 for b in c.descendants():
                     try:
                         if b.class_name() == "Button" and b.window_text() in ("取消", "关闭", "确定", "OK"):
-                            b.click()
+                            try:
+                                win32gui.SendMessage(int(b.handle), win32con.BM_CLICK, 0, 0)  # 消息化点击, 不移动鼠标
+                            except Exception:
+                                try:
+                                    b.click()
+                                except Exception:
+                                    pass
                             _wait(0.3)
                             closed = True
                     except Exception:
@@ -1663,7 +1682,10 @@ def _discover_accounts():
         app = user._app
         # 不用 user._main (可能过期), 每次重新定位主窗口
         win = _find_main_window(app) or user._main
-        win.set_focus()
+        try:
+            win.set_keyboard_focus()   # 仅设键盘焦点, 不甩鼠标(替代 win.set_focus)
+        except Exception:
+            pass
         _wait(0.8)  # 等窗口稳定
     except Exception:
         return []
@@ -1839,7 +1861,10 @@ def switch_account():
     try:
         app = user._app
         win = _find_main_window(app) or user._main
-        win.set_focus()
+        try:
+            win.set_keyboard_focus()   # 仅设键盘焦点, 不甩鼠标(替代 win.set_focus)
+        except Exception:
+            pass
         _wait(0.5)
         ok = _click_dropdown_item(app, win, target_idx - 1)
         if not ok:
