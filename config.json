@@ -1,0 +1,7 @@
+{
+  "_comment": "配置说明见 README。token 为接口鉴权密钥，请改为自己的随机字符串；host 默认 0.0.0.0 允许局域网访问；port 默认 1430；exe_path 为 xiadan.exe 完整路径（首次 prepare 时也可通过请求体覆盖）。环境变量 EASYTRADER_TOKEN / EASYTRADER_HOST / EASYTRADER_PORT / EASYTRADER_EXE_PATH 优先级高于本文件。",
+  "token": "easytrader-secret-2024",
+  "host": "0.0.0.0",
+  "port": 1430,
+  "exe_path": "D:\\同花顺软件\\同花顺\\同花顺\\同花顺\\xiadan.exe"
+}
