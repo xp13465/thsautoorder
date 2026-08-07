@@ -261,9 +261,7 @@ def _gui_call(fn, *, priority, refresh=False, name="gui_call", perf=None):
     """把一个"碰 GUI 客户端"的调用串行化提交给工作线程, 返回其结果.
     fn 内不要引用 flask.request(请求上下文只在 HTTP 线程可用); 所有入参请在 HTTP 线程先取好."""
     global _job_seq, _CUR_PERF
-    user = global_store.get("user")
-    if user is None:
-        raise RuntimeError("交易客户端未连接(prepare 未完成)")
+    # 不再在 HTTP 线程因 user is None 直接失败: 若守护开启, 改由 _body(worker 内)尝试自动拉起.
 
     t_enqueue = _t.time()
     if perf:
@@ -279,7 +277,13 @@ def _gui_call(fn, *, priority, refresh=False, name="gui_call", perf=None):
         try:
             u = global_store.get("user")
             if u is None:
-                raise RuntimeError("交易客户端未连接(prepare 未完成)")
+                # 从未做过 prepare(或服务重启后 global_store 清空): 若开启守护, 先尝试自动拉起
+                # xiadan 并连接(从零建立 user), 失败才算真正未连接. 这样"客户端没起来"时任意 API
+                # 也能自愈拉起, 不必干等看门狗(看门狗仅在 worker 空闲时才动作).
+                if CLIENT_GUARDIAN and _ensure_xiadan():
+                    u = global_store.get("user")
+                if u is None:
+                    raise RuntimeError("交易客户端未连接(prepare 未完成, 且自动拉起失败)")
             t_refresh = _t.time()
             if refresh:
                 try:
@@ -302,7 +306,8 @@ def _gui_call(fn, *, priority, refresh=False, name="gui_call", perf=None):
                     perf.mark("captcha_pre_done")
             # 客户端守护: 操作前 best-effort 探活, 客户端崩了先恢复(透明自愈)
             if CLIENT_GUARDIAN and not _xiadan_alive():
-                _ensure_xiadan()
+                if not _ensure_xiadan():
+                    print(f"[warn] 自愈拉起 xiadan 失败(客户端已崩溃); 若滞留在登录界面将返回需人工参与")
             # 自愈后确认客户端已真正登录(主窗口就绪且登录对话框已关闭); 未登录则等待
             # 自动登录(最多 CLIENT_LOGIN_WAIT_TIMEOUT 秒). 仍停留在登录界面(自动登录未完成/
             # 被验证码拦截/需人工) -> 直接返回"需人工参与", 不再让查询在登录界面上跑(否则
@@ -1564,7 +1569,8 @@ def health():
         # 客户端守护状态
         "xiadan_alive": _xiadan_alive(),
         "xiadan_logged_in": _is_logged_in(),
-        "xiadan_status": _xiadan_status,
+        # 缓存状态可能在一次失败尝试后停留为 recovering/broken; 若实时探活已就绪则覆盖为 ok, 避免误报
+        "xiadan_status": (_xiadan_status if not (_xiadan_alive() and _is_logged_in()) else "ok"),
         "xiadan_pid": _xiadan_pid,
         # EasyOCR 现为【进程内】常驻: torch/Reader 在启动期由 _get_ocr_reader() 加载一次并预热,
         # ocr_ready=True 表示进程内识别器已就绪(验证码解卡走进程内亚秒级推理, 复刻"昨晚版"速度);
