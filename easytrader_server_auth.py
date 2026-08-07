@@ -275,15 +275,28 @@ def _gui_call(fn, *, priority, refresh=False, name="gui_call", perf=None):
             perf.mark("body_run")
             _CUR_PERF = perf
         try:
+            # 1) 冷启动: 客户端未连接(user 为空)时, 守护先拉起客户端. 只等进程/窗口起来(不要求已登录),
+            #    连接(user.prepare)需交易主窗口, 故延后到下方确认登录后再做. 失败(进程都起不来)才真未连接.
             u = global_store.get("user")
             if u is None:
-                # 从未做过 prepare(或服务重启后 global_store 清空): 若开启守护, 先尝试自动拉起
-                # xiadan 并连接(从零建立 user), 失败才算真正未连接. 这样"客户端没起来"时任意 API
-                # 也能自愈拉起, 不必干等看门狗(看门狗仅在 worker 空闲时才动作).
                 if CLIENT_GUARDIAN and _ensure_xiadan():
+                    u = global_store.get("user")  # 热路径(已有窗口且已登录)立即拿到; 冷启动仍为 None
+                if u is None and not _xiadan_window_up():
+                    raise RuntimeError("交易客户端未连接(自动拉起失败)")
+            # 2) 等登录: 交易主窗口就绪且登录对话框已关闭才放查询进来. 停留在登录界面
+            #    (自动登录未完成/需人工) -> 最多等 CLIENT_LOGIN_WAIT_TIMEOUT 秒, 超时返回 423 需人工参与.
+            #    登录一完成即立即通过(轮询间隔 1s), 不空等整段超时.
+            if CLIENT_GUARDIAN and not _is_logged_in():
+                if not _wait_for_login(CLIENT_LOGIN_WAIT_TIMEOUT):
+                    raise _LoginRequiredError()
+            # 3) 冷启动延后连接: 登录已确认, 交易主窗口此时已存在, 现在建立 user 连接再执行.
+            u = global_store.get("user")
+            if u is None:
+                if CLIENT_GUARDIAN and _xiadan_window_up():
+                    _connect_pending_client()
                     u = global_store.get("user")
                 if u is None:
-                    raise RuntimeError("交易客户端未连接(prepare 未完成, 且自动拉起失败)")
+                    raise RuntimeError("交易客户端未连接(prepare 未完成)")
             t_refresh = _t.time()
             if refresh:
                 try:
@@ -304,17 +317,10 @@ def _gui_call(fn, *, priority, refresh=False, name="gui_call", perf=None):
                 dt_captcha_pre = _t.time() - t_cap
                 if perf:
                     perf.mark("captcha_pre_done")
-            # 客户端守护: 操作前 best-effort 探活, 客户端崩了先恢复(透明自愈)
+            # 4) 客户端守护: 操作前 best-effort 探活, 客户端崩了先恢复(透明自愈)
             if CLIENT_GUARDIAN and not _xiadan_alive():
                 if not _ensure_xiadan():
                     print(f"[warn] 自愈拉起 xiadan 失败(客户端已崩溃); 若滞留在登录界面将返回需人工参与")
-            # 自愈后确认客户端已真正登录(主窗口就绪且登录对话框已关闭); 未登录则等待
-            # 自动登录(最多 CLIENT_LOGIN_WAIT_TIMEOUT 秒). 仍停留在登录界面(自动登录未完成/
-            # 被验证码拦截/需人工) -> 直接返回"需人工参与", 不再让查询在登录界面上跑(否则
-            # 复制失败 + 误触发验证码会干扰自动登录).
-            if CLIENT_GUARDIAN and not _is_logged_in():
-                if not _wait_for_login(CLIENT_LOGIN_WAIT_TIMEOUT):
-                    raise _LoginRequiredError()
             t_fn = _t.time()
             if perf:
                 perf.mark("fn_start")
@@ -1810,8 +1816,11 @@ def _is_login_dialog_open():
 
 
 def _is_logged_in():
-    """客户端是否真正处于已登录的交易状态: 主窗口就绪(已连上真实进程)且当前没有登录对话框遮挡."""
-    if not _xiadan_alive():
+    """客户端是否真正处于已登录的交易状态: 交易主窗口就绪(桌面可见, 标题含'股票交易',
+    非登录对话框)且当前没有登录对话框遮挡. 不依赖本服务是否已连接(user), 这样冷启动
+    等待自动登录时也能正确判定(否则 _xiadan_alive 在无 user 时恒 False, 会一直等满超时)."""
+    hwnd, _ = _find_xiadan_window()
+    if hwnd is None:
         return False
     if _is_login_dialog_open():
         return False
@@ -1987,6 +1996,24 @@ def _xiadan_alive():
     return True
 
 
+def _xiadan_window_up():
+    """客户端窗口是否已出现在桌面(交易主窗口或登录对话框), 不依赖本服务是否已连接(user).
+    用于冷启动拉起后判断'进程已起', 以及操作前探活(避免在无 user 时误判死亡而反复拉起)."""
+    return _find_xiadan_window()[0] is not None or _is_login_dialog_open()
+
+
+def _wait_for_client_window(pid, timeout):
+    """等待 xiadan 客户端窗口出现(登录对话框或交易主窗口任一即可). 仅确认进程已起, 不等登录.
+    比 _wait_for_main_window 更宽松: 启动后登录对话框会先出现, 交易主窗口在登录后才出现,
+    故只要任一窗口出现即视为'客户端已启动', 具体登录等待交给 _wait_for_login."""
+    deadline = _t.time() + timeout
+    while _t.time() < deadline:
+        if _find_xiadan_window()[0] or _is_login_dialog_open():
+            return True
+        _t.sleep(0.5)
+    return False
+
+
 def _switch_account_core(target_idx):
     """切换账户核心(被 /switch 与守护恢复共用). target_idx 为 hotkey(1-based).
     返回 (previous_label, actual_label, actual_account). 失败时抛异常."""
@@ -2110,6 +2137,23 @@ def _reconnect_to(pid):
     _reapply_active_account()
 
 
+def _connect_pending_client():
+    """冷启动拉起后, 待客户端登录完成再连接(连接需交易主窗口, 未登录时连接会失败/指向登录对话框).
+    定位当前真实 xiadan pid 并重连. 返回 True=连接成功."""
+    hwnd, pid = _find_xiadan_window()
+    if pid is None:
+        pid = _find_xiadan_pid()
+    if pid is None:
+        return False
+    try:
+        _reconnect_to(pid)
+        print(f"[info] 冷启动后已连接 xiadan pid={pid}")
+        return True
+    except Exception as e:
+        print(f"[warn] 冷启动后连接 xiadan 失败: {e}")
+        return False
+
+
 def _ensure_xiadan(force=False):
     """确保 xiadan 客户端存活且已连接. 返回 True=已恢复/本来就好; False=恢复失败.
     自动守护与 API(/xiadan/start)共用. 内部加锁防并发重入."""
@@ -2127,6 +2171,14 @@ def _ensure_xiadan(force=False):
             existing = _find_xiadan_pid()  # 兜底: 窗口标题没匹配时用进程名
         if existing:
             try:
+                # 停在登录界面: 此时连接(user.prepare)会指向登录对话框, 故不连,
+                # 仅标记窗口已起, 由 _body 等登录完成后再 _connect_pending_client.
+                if _is_login_dialog_open():
+                    _xiadan_status = "started"
+                    _xiadan_pid = existing
+                    _auto_retry_count = 0
+                    print(f"[info] 复用现有 xiadan 进程 pid={existing} (停在登录界面, 待登录后连接)")
+                    return True
                 _reconnect_to(existing)
                 _xiadan_status = "ok"
                 _xiadan_pid = existing
@@ -2151,14 +2203,15 @@ def _ensure_xiadan(force=False):
         try:
             _xiadan_status = "starting"
             new_pid = _launch_xiadan()
-            if not _wait_for_main_window(new_pid, CLIENT_STARTUP_TIMEOUT):
-                raise RuntimeError("启动后超时未出现主窗口(股票交易)")
-            _reconnect_to(new_pid)
-            _xiadan_status = "ok"
+            # 只等客户端窗口出现(登录对话框或主窗口), 不等登录: 连接(user.prepare)需交易主窗口,
+            # 未登录时连接会指向登录对话框 -> 延后到 _body 确认登录后再 _connect_pending_client.
+            if not _wait_for_client_window(new_pid, CLIENT_STARTUP_TIMEOUT):
+                raise RuntimeError("启动后超时未出现客户端窗口(股票交易主窗口或登录对话框)")
+            _xiadan_status = "started"
             _xiadan_pid = new_pid
             _auto_retry_count = 0
             _last_relaunch_ts = _t.time()
-            print(f"[info] xiadan 已启动并连接 pid={new_pid}")
+            print(f"[info] xiadan 已启动(待登录) pid={new_pid}")
             return True
         except Exception as e:
             print(f"[warn] 启动/连接 xiadan 失败: {e}")
