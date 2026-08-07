@@ -676,14 +676,16 @@ def _enter_code(dlg, code, img):
             _t.sleep(0.03)
 
     try:
-        # [备份: 昨晚稳定版行为] 把弹窗移入固定左上角(100,100)可见区, 确保能真正接收键击
-        try:
-            r = dlg.rectangle()
-            win32gui.SetWindowPos(dlg_hwnd, win32con.HWND_TOP, 100, 100,
-                                  r.width(), r.height(), win32con.SWP_SHOWWINDOW)
-            print("[info] 验证码弹窗已移到固定左上角 (100,100) 再填")
-        except Exception as e:
-            print("[warn] 移动弹窗到可见区失败:", e)
+        # 配置项 MOVE_WINDOWS(默认 False=不移动弹窗): 开启时把验证码弹窗移入固定左上角(100,100)可见区
+        # 验证结论: 不移动也能正常解卡(_enter_code 仍对弹窗 SetForegroundWindow+SetFocus 收键击), 移动仅提供布局余量
+        if MOVE_WINDOWS:
+            try:
+                r = dlg.rectangle()
+                win32gui.SetWindowPos(dlg_hwnd, win32con.HWND_TOP, 100, 100,
+                                      r.width(), r.height(), win32con.SWP_SHOWWINDOW)
+                print("[info] 验证码弹窗已移到固定左上角 (100,100) 再填")
+            except Exception as e:
+                print("[warn] 移动弹窗到可见区失败:", e)
         try:
             win32gui.ShowWindow(dlg_hwnd, win32con.SW_RESTORE)
         except Exception:
@@ -954,8 +956,10 @@ def _patch_copy_get():
             pass
 
     def robust_get(self, control_id):
-        # 先确保 xiadan 在主屏可见区; 离屏时 SetForegroundWindow/键击均无法真正落盘
-        _ensure_xiadan_visible(getattr(self, "_main", None))
+        # 配置项 MOVE_WINDOWS(默认 False=不移动窗口): 把同花顺主窗口从副屏/离屏坐标移回主屏可见区
+        # 验证结论: 不移动也能正常复制/解卡(_robust_copy_keys 直接对 Grid 置前台+键盘焦点), 移动仅提供布局余量
+        if MOVE_WINDOWS:
+            _ensure_xiadan_visible(getattr(self, "_main", None))
         _t0 = _t.time()
         grid = self._get_grid(control_id)
         # ---- 快速路径: 复制一次, 成功即返回, 完全不查验证码(零开销, 满足无验证码≤1s) ----
@@ -1099,6 +1103,7 @@ def load_config():
         "port": 1430,
         "exe_path": r"D:\同花顺软件\同花顺\同花顺\同花顺\xiadan.exe",
         "grid_strategy": "copy",  # "copy"(默认, 原生剪贴板, 验证码自动解卡) | "xls"(Ctrl+S 另存降频)
+        "move_windows": False,  # 是否把同花顺主窗口/验证码弹窗移到主屏可见区(默认 False=不移动, 不打扰布局); 验证表明不移动也能正常复制/解卡
     }
     cfg = dict(defaults)
     try:
@@ -1120,6 +1125,8 @@ TOKEN = os.environ.get("EASYTRADER_TOKEN", CONFIG["token"])
 HOST = os.environ.get("EASYTRADER_HOST", CONFIG["host"])
 PORT = int(os.environ.get("EASYTRADER_PORT", CONFIG["port"]))
 EXE_PATH = os.environ.get("EASYTRADER_EXE_PATH", CONFIG["exe_path"])
+# 配置项: 是否移动窗口(默认 False=不移动). 环境变量 EASYTRADER_MOVE_WINDOWS=1/true/yes/on 可临时开启
+MOVE_WINDOWS = os.environ.get("EASYTRADER_MOVE_WINDOWS", str(CONFIG["move_windows"])).strip().lower() in ("1", "true", "yes", "on")
 HTML_FILE = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
     "easytrader_test.html",

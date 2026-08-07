@@ -1,7 +1,8 @@
 {
-  "_comment": "配置说明见 README。token 为接口鉴权密钥，请改为自己的随机字符串；host 默认 0.0.0.0 允许局域网访问；port 默认 1430；exe_path 为 xiadan.exe 完整路径（首次 prepare 时也可通过请求体覆盖）。环境变量 EASYTRADER_TOKEN / EASYTRADER_HOST / EASYTRADER_PORT / EASYTRADER_EXE_PATH 优先级高于本文件。",
+  "_comment": "配置说明见 README。token 为接口鉴权密钥，请改为自己的随机字符串；host 默认 0.0.0.0 允许局域网访问；port 默认 1430；exe_path 为 xiadan.exe 完整路径（首次 prepare 时也可通过请求体覆盖）。move_windows 默认 false：是否把同花顺主窗口/验证码弹窗移到主屏可见区，false=不移动（不打扰布局，验证表明仍能正常复制/解卡）；设为 true 恢复旧行为。环境变量 EASYTRADER_TOKEN / EASYTRADER_HOST / EASYTRADER_PORT / EASYTRADER_EXE_PATH / EASYTRADER_MOVE_WINDOWS 优先级高于本文件。",
   "token": "easytrader-secret-2024",
   "host": "0.0.0.0",
   "port": 1430,
-  "exe_path": "D:\\同花顺软件\\同花顺\\同花顺\\同花顺\\xiadan.exe"
+  "exe_path": "D:\\同花顺软件\\同花顺\\同花顺\\同花顺\\xiadan.exe",
+  "move_windows": false
 }
