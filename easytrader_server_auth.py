@@ -112,6 +112,10 @@ class _RejectError(Exception):
     """reject 模式下查询过于频繁, 直接拒绝(等价旧 429)."""
 
 
+class _LoginRequiredError(Exception):
+    """客户端停留在登录界面(自动登录未完成/被验证码拦截/需人工输入), 无法继续操作."""
+
+
 class _Job:
     __slots__ = ("priority", "seq", "fn", "result", "exc", "event", "t_submit", "perf")
 
@@ -299,6 +303,13 @@ def _gui_call(fn, *, priority, refresh=False, name="gui_call", perf=None):
             # 客户端守护: 操作前 best-effort 探活, 客户端崩了先恢复(透明自愈)
             if CLIENT_GUARDIAN and not _xiadan_alive():
                 _ensure_xiadan()
+            # 自愈后确认客户端已真正登录(主窗口就绪且登录对话框已关闭); 未登录则等待
+            # 自动登录(最多 CLIENT_LOGIN_WAIT_TIMEOUT 秒). 仍停留在登录界面(自动登录未完成/
+            # 被验证码拦截/需人工) -> 直接返回"需人工参与", 不再让查询在登录界面上跑(否则
+            # 复制失败 + 误触发验证码会干扰自动登录).
+            if CLIENT_GUARDIAN and not _is_logged_in():
+                if not _wait_for_login(CLIENT_LOGIN_WAIT_TIMEOUT):
+                    raise _LoginRequiredError()
             t_fn = _t.time()
             if perf:
                 perf.mark("fn_start")
@@ -345,6 +356,9 @@ def _translate(exc):
     if isinstance(exc, _RejectError):
         return jsonify({"error": "too_frequent",
                          "msg": f"查询过于频繁, 同花顺会触发风控, 请至少间隔{_MIN_GRID_INTERVAL:.0f}秒"}), 429
+    if isinstance(exc, _LoginRequiredError):
+        return jsonify({"error": "login_required",
+                        "msg": f"客户端停留在登录界面, 无法继续操作(自动登录未完成/被验证码拦截/需人工输入). 请手动登录后重试, 或稍后由看门狗/下次请求自动恢复"}), 423
     return jsonify({"error": "internal", "msg": str(exc)}), 500
 
 
@@ -398,7 +412,13 @@ def _is_captcha_window(w):
             blob += (c.window_text() or "") + "\n"
     except Exception:
         return False
-    if any(k in blob for k in ("验证码", "拷贝", "先输入", "检测到您正在")):
+    # 排除登录界面验证码(账号密码已保存, 自动登录时偶尔弹图形验证码), 避免误当成
+    # '股票复制识别'复制验证码去 OCR 填入(即用户见到的 2105), 进而干扰自动登录.
+    if any(k in blob for k in ("登录", "密码", "资金账号", "交易密码", "帐号")):
+        return False
+    # 仅匹配'股票复制识别'复制验证码: 正文必须提到'拷贝'(拷贝数据/检测到您正在拷贝).
+    # '拷贝'是该弹窗唯一稳定鉴别词, 登录验证码绝不会提'拷贝'.
+    if "拷贝" in blob or "拷贝数据" in blob or "检测到您正在拷贝" in blob:
         return True
     return False
 
@@ -1304,6 +1324,7 @@ def load_config():
         "client_max_auto_retries": 5, # 连续自动拉起失败达此数则停止自动拉起(置 broken, 需手动 POST /xiadan/start)
         "client_watchdog_interval": 20, # 后台看门狗轮询间隔(秒)
         "client_hide_console": True, # xiadan.exe 是 console 子系统, 守护重拉时会带一个控制台黑框; 启动后隐藏它(保留 GUI 交易窗口). 环境变量 EASYTRADER_CLIENT_HIDE_CONSOLE 可关
+        "client_login_wait_timeout": 30, # 守护拉起/重连后, 等待客户端真正登录(关闭登录对话框)的最长秒数; 超时仍停在登录界面则接口返回"需人工参与"
     }
     cfg = dict(defaults)
     try:
@@ -1370,6 +1391,10 @@ try:
     CLIENT_HIDE_CONSOLE = str(os.environ.get("EASYTRADER_CLIENT_HIDE_CONSOLE", str(CONFIG["client_hide_console"]))).strip().lower() in ("1", "true", "yes", "on")
 except Exception:
     CLIENT_HIDE_CONSOLE = True
+try:
+    CLIENT_LOGIN_WAIT_TIMEOUT = float(os.environ.get("EASYTRADER_CLIENT_LOGIN_WAIT_TIMEOUT", CONFIG["client_login_wait_timeout"]))
+except Exception:
+    CLIENT_LOGIN_WAIT_TIMEOUT = 30.0
 # 守护运行时状态(供 /health 与看门狗读写)
 _RELAUNCH_LOCK = _threading.Lock()
 _xiadan_status = "unknown"      # unknown | ok | starting | recovering | broken | stopped
@@ -1461,6 +1486,7 @@ def health():
         "ocr_ready": bool(_OCR_READY),
         # 客户端守护状态
         "xiadan_alive": _xiadan_alive(),
+        "xiadan_logged_in": _is_logged_in(),
         "xiadan_status": _xiadan_status,
         "xiadan_pid": _xiadan_pid,
         # EasyOCR 现为【进程内】常驻: torch/Reader 在启动期由 _get_ocr_reader() 加载一次并预热,
@@ -1667,6 +1693,60 @@ def _refresh_user_window(user):
 #       + 自愈挂载点(每次 GUI 操作前 best-effort 检查, 死了先恢复; 操作抛死窗异常则恢复后重试一次)
 #       + 后台看门狗线程(提前恢复) + API 控制面(/xiadan/start|stop) + /health 暴露状态.
 # 复用既有函数, 不重写任何验证码检测/填入代码.
+
+def _is_login_dialog(w):
+    """顶层 #32770 对话框是否为同花顺登录对话框(遮挡主窗口, 需人工/自动登录).
+    鉴别: 正文同时含'登录' 与 (密码/资金账号/帐号/交易密码). 仅靠'密码'单独匹配会误伤
+    '修改密码'等对话框, 故强制要求'登录'字样在场."""
+    try:
+        if (w.class_name() or "") != "#32770":
+            return False
+        blob = ""
+        try:
+            for c in w.descendants():
+                blob += (c.window_text() or "") + "\n"
+        except Exception:
+            pass
+        if "登录" in blob and any(k in blob for k in ("密码", "资金账号", "帐号", "交易密码")):
+            return True
+    except Exception:
+        return False
+    return False
+
+
+def _is_login_dialog_open():
+    """桌面上当前是否有同花顺登录对话框(未自动登录完成)."""
+    try:
+        d = pywinauto.Desktop(backend="win32")
+        for w in d.windows():
+            if _is_login_dialog(w):
+                return True
+    except Exception:
+        pass
+    return False
+
+
+def _is_logged_in():
+    """客户端是否真正处于已登录的交易状态: 主窗口就绪(已连上真实进程)且当前没有登录对话框遮挡."""
+    if not _xiadan_alive():
+        return False
+    if _is_login_dialog_open():
+        return False
+    return True
+
+
+def _wait_for_login(timeout):
+    """轮询等待客户端真正登录(主窗口就绪且登录对话框关闭). 最多 timeout 秒.
+    返回 True=已登录可操作; False=超时仍停留在登录界面(自动登录未完成/需人工验证码).
+    用于: 守护拉起/重连后, 即便主窗口已出现, 也要等自动登录跑完(5~20s)再放查询进来,
+    避免查询在登录界面上跑 -> 复制失败 -> 误触发验证码(2105)干扰自动登录."""
+    deadline = _t.time() + timeout
+    while _t.time() < deadline:
+        if _is_logged_in():
+            return True
+        _t.sleep(1.0)
+    return _is_logged_in()
+
 
 def _pid_alive(pid):
     """进程是否存活(Windows).
