@@ -1,0 +1,322 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>easytrader 测试面板</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+      background: #f0f2f5; color: #1a1a2e; padding: 16px; min-height: 100vh;
+    }
+    .header {
+      background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+      color: #fff; padding: 16px 24px; border-radius: 10px; margin-bottom: 16px;
+    }
+    .header h1 { font-size: 18px; font-weight: 700; }
+    .header p { font-size: 12px; opacity: 0.6; margin-top: 2px; }
+    .config-bar {
+      background: #fff; padding: 12px 16px; border-radius: 10px; margin-bottom: 16px;
+      display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.06);
+    }
+    .config-bar label { font-size: 13px; font-weight: 600; white-space: nowrap; }
+    .config-bar input {
+      padding: 7px 12px; border: 1px solid #d9d9d9; border-radius: 6px; font-size: 13px;
+    }
+    .config-bar input:focus { border-color: #2563eb; outline: none; }
+    .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+    @media (max-width: 900px) { .grid { grid-template-columns: 1fr; } }
+    .card {
+      background: #fff; border-radius: 10px; padding: 18px; margin-bottom: 16px;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.06);
+    }
+    .card h2 {
+      font-size: 14px; font-weight: 700; margin-bottom: 12px;
+      padding-bottom: 8px; border-bottom: 2px solid #f0f0f0;
+    }
+    .row { display: flex; align-items: center; gap: 8px; margin-bottom: 8px; flex-wrap: wrap; }
+    .row label { font-size: 12px; font-weight: 600; min-width: 70px; color: #555; }
+    .row input, .row select {
+      padding: 6px 10px; border: 1px solid #d9d9d9; border-radius: 5px; font-size: 13px;
+      flex: 1; min-width: 120px;
+    }
+    .row input:focus, .row select:focus { border-color: #2563eb; outline: none; }
+    .btn-group { display: flex; gap: 8px; flex-wrap: wrap; margin-top: 4px; }
+    button {
+      padding: 8px 16px; border: none; border-radius: 6px; font-size: 13px;
+      font-weight: 600; cursor: pointer; white-space: nowrap;
+      transition: opacity 0.15s, transform 0.1s;
+    }
+    button:hover { opacity: 0.88; }
+    button:active { transform: scale(0.97); }
+    .btn-blue { background: #2563eb; color: #fff; }
+    .btn-green { background: #16a34a; color: #fff; }
+    .btn-red { background: #dc2626; color: #fff; }
+    .btn-orange { background: #ea580c; color: #fff; }
+    .btn-gray { background: #6b7280; color: #fff; }
+    .response-card { min-height: 200px; }
+    .response-area {
+      background: #1e1e1e; color: #d4d4d4; padding: 14px; border-radius: 8px;
+      font-family: "Cascadia Code", "Fira Code", Consolas, monospace;
+      font-size: 12px; line-height: 1.5; max-height: 350px; overflow: auto;
+      white-space: pre-wrap; word-break: break-all;
+    }
+    .resp-status { font-weight: 700; margin-bottom: 6px; font-size: 13px; }
+    .resp-ok { color: #4ade80; }
+    .resp-err { color: #f87171; }
+    .resp-wait { color: #888; }
+    .tips { font-size: 11px; color: #999; margin-top: 6px; line-height: 1.6; }
+    .acct-row {
+      display: flex; align-items: center; gap: 8px; padding: 6px 0;
+      border-bottom: 1px solid #f5f5f5;
+    }
+    .acct-hotkey {
+      display: inline-block; min-width: 46px; text-align: center;
+      background: #f0f0f0; border-radius: 3px; font-size: 11px;
+      padding: 3px 6px; font-family: monospace;
+    }
+    .acct-id {
+      display: inline-block; min-width: 110px; text-align: center;
+      background: #eff6ff; border: 1px solid #bfdbfe; border-radius: 3px;
+      font-size: 11px; padding: 3px 6px; font-family: monospace; color: #1e40af;
+    }
+    .acct-active-row { background: #f0fdf4; border-radius: 4px; padding: 6px; }
+  </style>
+</head>
+<body>
+  <div class="header">
+    <h1>easytrader 交易测试面板</h1>
+    <p>Token 鉴权 + 同花顺内置多账户切换 (下拉列表点击) + 资金账号切换 + 全接口测试</p>
+  </div>
+
+  <div class="config-bar">
+    <label>Server</label>
+    <input id="serverUrl" type="text" placeholder="http://192.168.1.100:1430 (留空=同源)" style="min-width: 240px;">
+    <label>Token</label>
+    <input id="token" type="text" value="__TOKEN__" style="min-width: 200px;">
+    <button class="btn-blue" onclick="ping()">测试连接</button>
+    <button class="btn-gray" onclick="clearResp()">清空</button>
+  </div>
+
+  <div class="grid">
+    <div>
+      <div class="card">
+        <h2>连接登陆客户端 (prepare)</h2>
+        <div class="row"><label>broker</label><input id="broker" value="ths" placeholder="ths / universal_client"></div>
+        <div class="row"><label>PID</label><input id="pid" placeholder="留空则用 exe_path" type="number"></div>
+        <div class="row"><label>exe路径</label><input id="exe_path" value="__EXE_PATH__" placeholder="C:\同花顺\xiadan.exe"></div>
+        <div class="tips">先在 xiadan.exe 里手动登录所有账户. PID 和 exe_path 二选一.</div>
+        <div class="btn-group"><button class="btn-green" onclick="doPrepare()">连接登陆客户端</button></div>
+      </div>
+
+      <div class="card">
+        <h2>多账户切换 (同花顺账户下拉列表)</h2>
+        <div class="tips" style="margin-bottom:8px;">
+          同花顺 xiadan.exe 不支持多实例, 所有账户在一个窗口内. 切换通过点击账户下拉列表项实现.
+          可按资金账号 / 标签 / 快捷键切换. 登录后自动发现账户列表.
+        </div>
+        <div class="btn-group" style="margin-bottom:10px;">
+          <button class="btn-blue" onclick="loadAccounts()">刷新账户</button>
+          <button class="btn-blue" onclick="api('POST','/accounts/refresh');setTimeout(loadAccounts,500)">获取登陆账户清单</button>
+        </div>
+        <div id="accountList" style="font-size:12px;line-height:1.8;"></div>
+      </div>
+
+      <div class="card">
+        <h2>限价交易 buy / sell</h2>
+        <div class="row"><label>证券代码</label><input id="security" placeholder="162411"></div>
+        <div class="row"><label>价格</label><input id="price" placeholder="5.500" type="number" step="0.001"></div>
+        <div class="row"><label>数量</label><input id="amount" placeholder="100" type="number"></div>
+        <div class="btn-group">
+          <button class="btn-red" onclick="doTrade('buy')">限价买入</button>
+          <button class="btn-green" onclick="doTrade('sell')">限价卖出</button>
+        </div>
+        <div class="tips">买入红色 卖出绿色 (A股配色)</div>
+      </div>
+
+      <div class="card">
+        <h2>市价交易 market_buy / market_sell</h2>
+        <div class="row"><label>证券代码</label><input id="mkt_security" placeholder="162411"></div>
+        <div class="row"><label>数量</label><input id="mkt_amount" placeholder="100" type="number"></div>
+        <div class="row">
+          <label>市价类型</label>
+          <select id="ttype">
+            <option value="">默认(同花顺自动选)</option>
+            <option value="0">对手方最优价格</option>
+            <option value="1">本方最优价格</option>
+            <option value="2">最优五档即时成交剩余撤销</option>
+            <option value="3">最优五档即时成交剩余转限价</option>
+            <option value="4">全部成交或撤销</option>
+          </select>
+        </div>
+        <div class="row"><label>保护价</label><input id="limit_price" placeholder="可选" type="number" step="0.001"></div>
+        <div class="btn-group">
+          <button class="btn-red" onclick="doMarketTrade('market_buy')">市价买入</button>
+          <button class="btn-green" onclick="doMarketTrade('market_sell')">市价卖出</button>
+        </div>
+        <div class="tips">市价委托不需填价格, 按市场实时价格成交</div>
+      </div>
+
+      <div class="card">
+        <h2>撤单</h2>
+        <div class="row"><label>委托号</label><input id="entrust_no" placeholder="entrust_no"></div>
+        <div class="btn-group">
+          <button class="btn-orange" onclick="doCancel()">撤单</button>
+          <button class="btn-red" onclick="api('GET','/cancel_all_entrusts')">一键撤全部</button>
+        </div>
+      </div>
+    </div>
+
+    <div>
+      <div class="card">
+        <h2>查询</h2>
+        <div class="btn-group">
+          <button class="btn-blue" onclick="api('GET','/balance')">查资金</button>
+          <button class="btn-blue" onclick="api('GET','/position')">查持仓</button>
+          <button class="btn-blue" onclick="api('GET','/today_entrusts')">当日委托</button>
+          <button class="btn-blue" onclick="api('GET','/today_trades')">当日成交</button>
+          <button class="btn-blue" onclick="api('GET','/cancel_entrusts')">可撤委托</button>
+          <button class="btn-orange" onclick="api('GET','/auto_ipo')">一键打新</button>
+        </div>
+        <div class="tips">点击按钮后结果显示在右下角响应区</div>
+      </div>
+
+      <div class="card">
+        <h2>会话</h2>
+        <div class="btn-group"><button class="btn-gray" onclick="api('GET','/exit')">退出登录</button></div>
+      </div>
+
+      <div class="card response-card">
+        <h2>响应结果</h2>
+        <div class="response-area" id="response">
+          <div class="resp-status resp-wait">等待操作...</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    function sv() { return document.getElementById('serverUrl').value.trim(); }
+    function tk() { return document.getElementById('token').value.trim(); }
+    function val(id) { return document.getElementById(id).value.trim(); }
+
+    async function api(method, path, body) {
+      const url = sv() + path;
+      const opts = { method, headers: { 'Content-Type': 'application/json', 'X-Token': tk() } };
+      if (body) opts.body = JSON.stringify(body);
+      setResp('loading', method + ' ' + path + ' ...', '');
+      try {
+        const r = await fetch(url, opts);
+        const t = await r.text();
+        let json;
+        try { json = JSON.stringify(JSON.parse(t), null, 2); } catch { json = t; }
+        setResp(r.ok ? 'ok' : 'err', r.status + ' ' + r.statusText, json);
+      } catch(e) {
+        setResp('err', '请求失败', e.message);
+      }
+    }
+
+    function setResp(type, status, body) {
+      const c = type === 'ok' ? 'resp-ok' : type === 'err' ? 'resp-err' : 'resp-wait';
+      document.getElementById('response').innerHTML =
+        '<div class="resp-status ' + c + '">' + status + '</div>' +
+        (body ? '<div>' + escHtml(body) + '</div>' : '');
+    }
+
+    function escHtml(s) {
+      return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    }
+
+    function clearResp() {
+      document.getElementById('response').innerHTML = '<div class="resp-status resp-wait">已清空</div>';
+    }
+
+    function ping() { api('GET', '/health'); }
+
+    function doPrepare() {
+      const b = { broker: val('broker') };
+      if (val('pid')) b.pid = parseInt(val('pid'));
+      else if (val('exe_path')) b.exe_path = val('exe_path');
+      api('POST', '/prepare', b);
+      setTimeout(loadAccounts, 1500);
+    }
+
+    function doTrade(action) {
+      api('POST', '/' + action, {
+        security: val('security'),
+        price: parseFloat(val('price')),
+        amount: parseInt(val('amount'))
+      });
+    }
+
+    function doMarketTrade(action) {
+      const b = {
+        security: val('mkt_security'),
+        amount: parseInt(val('mkt_amount'))
+      };
+      const tt = val('ttype');
+      if (tt !== '') b.ttype = tt;
+      if (val('limit_price')) b.limit_price = parseFloat(val('limit_price'));
+      api('POST', '/' + action, b);
+    }
+
+    function doCancel() {
+      api('POST', '/cancel_entrust', { entrust_no: val('entrust_no') });
+    }
+
+    async function loadAccounts() {
+      const url = sv() + '/accounts';
+      try {
+        const r = await fetch(url, { headers: { 'X-Token': tk() } });
+        const data = await r.json();
+        const el = document.getElementById('accountList');
+        if (!data.accounts || data.accounts.length === 0) {
+          el.innerHTML = '<div style="color:#999;padding:8px;background:#fafafa;border-radius:4px;">' +
+            '未登录或未发现账户.<br>' +
+            '请先在 xiadan.exe 登录多个账户, 然后点"连接登陆客户端"再点"刷新账户".' +
+            '</div>';
+          return;
+        }
+        const header = '<div style="margin-bottom:8px;color:#666;font-size:11px;padding-bottom:6px;border-bottom:1px solid #eee;">' +
+          escHtml(data.switch_via || '切换: Alt+N / account') +
+          ' | 当前: <b style="color:#16a34a;">' + escHtml(data.active || '(未知)') + '</b>' +
+          (data.active_account ? ' <code style="color:#1e40af;">' + escHtml(data.active_account) + '</code>' : '') +
+          ' | 共 ' + data.count + ' 个</div>';
+        const rows = data.accounts.map(a =>
+          '<div class="acct-row ' + (a.active ? 'acct-active-row' : '') + '">' +
+          '<span class="acct-hotkey">' + (a.hotkey > 0 ? 'Alt+' + a.hotkey : '—') + '</span>' +
+          (a.account ? '<span class="acct-id">' + escHtml(a.account) + '</span>' : '') +
+          '<span style="flex:1;color:' + (a.active ? '#16a34a;font-weight:700;' : '#555;') + '">' + escHtml(a.label) + '</span>' +
+          (a.active
+            ? '<span style="color:#16a34a;font-size:11px;">●活跃</span>'
+            : '<button class="btn-blue" style="padding:4px 12px;font-size:11px;" onclick="switchByAccount(\'' + (a.account || '') + '\',' + a.hotkey + ')">切换</button>') +
+          '</div>'
+        ).join('');
+        el.innerHTML = header + rows;
+      } catch(e) {
+        document.getElementById('accountList').innerHTML = '<span style="color:#f87171;">' + e.message + '</span>';
+      }
+    }
+
+    async function switchByAccount(acct, hotkey) {
+      if (acct) {
+        await api('GET', '/switch?account=' + acct);
+      } else {
+        await api('GET', '/switch?hotkey=' + hotkey);
+      }
+      // 等切换响应回来 (服务端已等 2s 并读回 actual) 再刷新列表
+      setTimeout(loadAccounts, 300);
+    }
+
+    async function switchTo(hotkey) {
+      await api('GET', '/switch?hotkey=' + hotkey);
+      setTimeout(loadAccounts, 300);
+    }
+
+    // 启动时自动加载账户列表
+    setTimeout(loadAccounts, 500);
+  </script>
+</body>
+</html>

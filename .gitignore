@@ -1,0 +1,24 @@
+# ===== 运行时 / 环境垃圾(不入库) =====
+__pycache__/
+*.pyc
+*.pyo
+*.log
+*.pid
+*.png
+*.jpg
+tmp.png
+
+# 运行时产物
+captcha_captures/
+_archive_*/
+_pos_*.json
+_selftest_*.json
+
+# 含密钥的真实配置(改为 config.example.json 占位提交)
+config.json
+
+# 编辑器 / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

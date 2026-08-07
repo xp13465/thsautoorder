@@ -1,0 +1,16 @@
+# easytrader 交易服务端部署依赖
+# 运行在装有券商客户端 (同花顺 xiadan.exe) 的 Windows 交易电脑上
+easytrader>=0.23.7
+flask>=2.3
+pywinauto>=0.6.6
+requests>=2.25
+
+# 验证码自动识别(默认启用): easyocr 会一并安装 CPU 版 torch(数百 MB),
+# 首次运行联网下载 OCR 模型(数十 MB). 必须装在启动本服务所用的同一个 python.
+easyocr>=1.7
+pillow>=9.0
+numpy>=1.23
+
+# 可选: 仅 benchmark_engines.py 的 Tesseract 对比需要
+# (还需另行安装 Tesseract 二进制, 如 UB-Mannheim 版)
+# pytesseract>=0.3
