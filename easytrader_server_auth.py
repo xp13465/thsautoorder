@@ -1030,19 +1030,28 @@ def _patch_copy_get():
 
     def _robust_copy_keys(copy_self, grid):
         """可靠地把 grid 内容复制进剪贴板: 先置前台 + 置键盘焦点, 再发 ^A^C.
-        关键: 必须 grid.set_focus()(SetFocus 键盘焦点) 配合 type_keys(set_foreground=True),
-        否则后台进程前台锁会导致 SendInput 的 Ctrl+C 打到别的窗口 -> 复制偶发落空(之前 ~50% 失败根因)."""
+        关键: 必须给 grid 设键盘焦点 + 把同花顺窗口置前台, 否则后台进程前台锁会导致
+        SendInput 的 Ctrl+C 打到别的窗口 -> 复制偶发落空(之前 ~50% 失败根因).
+        【精简无效行为·去除甩鼠标】原 grid.set_focus() 会触发 pywinauto HwndWrapper.set_focus
+        把鼠标甩到 (-10000,500) 屏幕外(=用户看到的"鼠标停留到下单窗口外空白处"根因);
+        type_keys(set_foreground=True) 内部还会再调一次 set_focus 重复甩鼠标。
+        改为 grid.set_keyboard_focus()(仅 AttachThreadInput + win32gui.SetFocus 设键盘焦点,
+        完全不碰鼠标) + type_keys(set_foreground=False), 保留"点击表格获取焦点"的语义但不再移动鼠标。
+        —— 回退方式: 把 grid.set_keyboard_focus() 改回 grid.set_focus(),
+            grid.type_keys("^A^C", set_foreground=False) 改回 set_foreground=True。"""
         try:
-            copy_self._set_foreground(grid)
+            copy_self._set_foreground(grid)   # 仍把同花顺窗口置前台(SetForegroundWindow, 不移动鼠标)
         except Exception:
             pass
+        # 【已注释·回退用】try: grid.set_focus() except Exception: pass
         try:
-            grid.set_focus()
+            grid.set_keyboard_focus()         # 仅设键盘焦点, 不移动鼠标(替代 grid.set_focus)
         except Exception:
             pass
         _t.sleep(0.05)
         try:
-            grid.type_keys("^A^C", set_foreground=True)
+            # 【已注释·回退用】grid.type_keys("^A^C", set_foreground=True)
+            grid.type_keys("^A^C", set_foreground=False)  # 不触发 set_focus, 不再移鼠标
         except Exception:
             pass
 
