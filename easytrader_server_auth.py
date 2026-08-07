@@ -112,9 +112,9 @@ class _RejectError(Exception):
 
 
 class _Job:
-    __slots__ = ("priority", "seq", "fn", "result", "exc", "event", "t_submit")
+    __slots__ = ("priority", "seq", "fn", "result", "exc", "event", "t_submit", "perf")
 
-    def __init__(self, priority, seq, fn):
+    def __init__(self, priority, seq, fn, perf=None):
         self.priority = priority
         self.seq = seq
         self.fn = fn
@@ -122,6 +122,7 @@ class _Job:
         self.exc = None
         self.event = _threading.Event()
         self.t_submit = _t.time()   # 入队时刻(请求线程), 用于算队列等待
+        self.perf = perf            # _Perf 实例(全链路埋点), 供工作线程内部打点
 
     def __lt__(self, other):
         # 优先级小的先执行; 同优先级按入队序号 FIFO.
@@ -138,6 +139,59 @@ _job_seq = 0
 _job_seq_lock = _threading.Lock()
 
 
+# ==================== 日志级别开关 + 耗时监控埋点 (2026-08-07) ====================
+# perf_log   : 是否输出节点级耗时监控([perf] 埋点). 不开发时设 false 关闭.
+# verbose_log: 是否输出常规运行日志([info]/[warn]/[dbg]/[diag]/[exc]). 不开发时设 false 关闭, 降低 I/O 消耗.
+# 通过 monkeypatch builtins.print 按 [tag] 前缀统一门控, 不动各调用点.
+PERF_LOG = True
+VERBOSE_LOG = True
+import builtins as _builtins
+_REAL_PRINT = _builtins.print
+def _gated_print(*args, **kwargs):
+    if args:
+        a0 = args[0]
+        if isinstance(a0, str):
+            if a0.startswith("[perf]"):
+                if not PERF_LOG:
+                    return
+            elif a0[:1] == "[" and (
+                a0.startswith("[info]") or a0.startswith("[dbg]") or a0.startswith("[debug]")
+                or a0.startswith("[warn]") or a0.startswith("[diag]") or a0.startswith("[exc]")
+            ):
+                if not VERBOSE_LOG:
+                    return
+    _REAL_PRINT(*args, **kwargs)
+_builtins.print = _gated_print
+
+
+class _Perf:
+    """节点级耗时埋点: 一次请求一个实例, 各阶段 mark 记录相对上一节点增量."""
+    __slots__ = ("name", "t0", "marks")
+    def __init__(self, name):
+        self.name = name
+        self.t0 = _t.time()
+        self.marks = [("recv", self.t0)]
+    def mark(self, label):
+        if not PERF_LOG:
+            return
+        self.marks.append((label, _t.time()))
+    def emit(self):
+        if not PERF_LOG:
+            return
+        total = (_t.time() - self.t0) * 1000.0
+        parts = []
+        for i in range(1, len(self.marks)):
+            d = (self.marks[i][1] - self.marks[i-1][1]) * 1000.0
+            parts.append(f"{self.marks[i][0]}+{d:.1f}")
+        _REAL_PRINT(f"[perf] {self.name} TOTAL={total:.1f}ms | " + " ".join(parts))
+
+
+_CUR_PERF = None  # 工作线程执行 fn 时指向当前请求 _Perf, 供内部函数(复制/解卡)打点
+def _perf_mark(label):
+    if PERF_LOG and _CUR_PERF is not None:
+        _CUR_PERF.mark(label)
+
+
 def _gui_worker():
     """后台单线程: 从优先级队列取任务, 串行驱动 GUI, 控制操作间隔."""
     global _WORKER_LAST_TS
@@ -145,6 +199,8 @@ def _gui_worker():
         job = _Q.get()
         t_pick = _t.time()
         q_wait = t_pick - getattr(job, "t_submit", t_pick)   # 队列等待 = 入队到被Worker取走
+        if job.perf:
+            job.perf.mark("pickup")
         try:
             # 间隔节流(防同花顺风控): 距上次 GUI 操作不足间隔则等满.
             t_thr0 = _t.time()
@@ -152,8 +208,12 @@ def _gui_worker():
             if elapsed < _MIN_GRID_INTERVAL:
                 _t.sleep(_MIN_GRID_INTERVAL - elapsed)
             throttle = _t.time() - t_thr0
+            if job.perf:
+                job.perf.mark("throttle")
             _WORKER_BUSY.set()
             t_body0 = _t.time()
+            if job.perf:
+                job.perf.mark("body_start")
             try:
                 job.result = job.fn()
             except Exception as e:  # 任意异常都记到 job, 由调用方翻译
@@ -171,7 +231,8 @@ def _gui_worker():
                 _WORKER_LAST_TS = _t.time()
                 _sweep_captcha_after()
                 _WORKER_BUSY.clear()
-                print(f"[perf] worker: queue_wait={q_wait:.3f}s throttle={throttle:.3f}s body={body_dur:.3f}s seq={job.seq} prio={job.priority}")
+                if job.perf:
+                    job.perf.mark("body_done")
         finally:
             _Q.task_done()
 
@@ -185,43 +246,62 @@ def _start_worker():
     _get_ocr_reader()
 
 
-def _gui_call(fn, *, priority, refresh=False, name="gui_call"):
+def _gui_call(fn, *, priority, refresh=False, name="gui_call", perf=None):
     """把一个"碰 GUI 客户端"的调用串行化提交给工作线程, 返回其结果.
     fn 内不要引用 flask.request(请求上下文只在 HTTP 线程可用); 所有入参请在 HTTP 线程先取好."""
-    global _job_seq
+    global _job_seq, _CUR_PERF
     user = global_store.get("user")
     if user is None:
         raise RuntimeError("交易客户端未连接(prepare 未完成)")
 
     t_enqueue = _t.time()
+    if perf:
+        perf.mark("enqueue")
 
     def _body():
+        global _CUR_PERF
         t_body = _t.time()
         queue_wait = t_body - t_enqueue   # 本请求在队列中等待(worker 忙/间隔节流)的耗时
-        u = global_store.get("user")
-        if u is None:
-            raise RuntimeError("交易客户端未连接(prepare 未完成)")
-        t_refresh = _t.time()
-        if refresh:
-            try:
-                _refresh_user_window(u)
-            except Exception:
-                pass
-        dt_refresh = _t.time() - t_refresh
-        # 执行前 best-effort 清掉已开的验证码弹窗(避免 GUI 自动化被卡住)
-        dt_captcha_pre = 0.0
-        if _captcha_open():
-            t_cap = _t.time()
-            if not _solve_captcha():
-                raise _CaptchaError()
-            dt_captcha_pre = _t.time() - t_cap
-        t_fn = _t.time()
+        if perf:
+            perf.mark("body_run")
+            _CUR_PERF = perf
         try:
-            result = fn()
+            u = global_store.get("user")
+            if u is None:
+                raise RuntimeError("交易客户端未连接(prepare 未完成)")
+            t_refresh = _t.time()
+            if refresh:
+                try:
+                    _refresh_user_window(u)
+                except Exception:
+                    pass
+            if perf:
+                perf.mark("refresh")
+            dt_refresh = _t.time() - t_refresh
+            # 执行前 best-effort 清掉已开的验证码弹窗(避免 GUI 自动化被卡住)
+            dt_captcha_pre = 0.0
+            if _captcha_open():
+                if perf:
+                    perf.mark("captcha_pre")
+                t_cap = _t.time()
+                if not _solve_captcha():
+                    raise _CaptchaError()
+                dt_captcha_pre = _t.time() - t_cap
+                if perf:
+                    perf.mark("captcha_pre_done")
+            t_fn = _t.time()
+            if perf:
+                perf.mark("fn_start")
+            try:
+                result = fn()
+            finally:
+                if perf:
+                    perf.mark("fn_done")
+                    dt_fn = _t.time() - t_fn
+                    print(f"[perf] {name}: queue_wait={queue_wait:.3f}s refresh={dt_refresh:.3f}s captcha_pre={dt_captcha_pre:.3f}s fn={dt_fn:.3f}s")
+            return result
         finally:
-            dt_fn = _t.time() - t_fn
-            print(f"[perf] {name}: queue_wait={queue_wait:.3f}s body_total={_t.time()-t_body:.3f}s refresh={dt_refresh:.3f}s captcha_pre={dt_captcha_pre:.3f}s fn={dt_fn:.3f}s")
-        return result
+            _CUR_PERF = None
 
     # reject 模式: 查询类若"工作线程正忙"或"间隔未到" -> 直接 429, 不入队
     if MODE == "reject" and priority == _QUERY_PRIORITY:
@@ -230,7 +310,7 @@ def _gui_call(fn, *, priority, refresh=False, name="gui_call"):
     with _job_seq_lock:
         seq = _job_seq
         _job_seq += 1
-    job = _Job(priority, seq, _body)
+    job = _Job(priority, seq, _body, perf=perf)
     _Q.put(job)
     if not job.event.wait(timeout=_QUEUE_TIMEOUT):
         raise _QueueTimeoutError()
@@ -255,13 +335,15 @@ def _translate(exc):
 def _gui_view(fn, *, priority, refresh, status=200, name="view"):
     """构造一个走队列的视图函数(用于覆盖原始路由)."""
     def _wrapper():
-        t0 = _t.time()
+        perf = _Perf(name)
         try:
-            res = _gui_call(fn, priority=priority, refresh=refresh, name=name)
+            res = _gui_call(fn, priority=priority, refresh=refresh, name=name, perf=perf)
         except Exception as e:
-            print(f"[perf] {name}: TOTAL={_t.time()-t0:.3f}s -> ERROR {type(e).__name__}")
+            perf.mark("error")
+            perf.emit()
             return _translate(e)
-        print(f"[perf] {name}: TOTAL={_t.time()-t0:.3f}s OK")
+        perf.mark("response")
+        perf.emit()
         return jsonify(res), status
     return _wrapper
 
@@ -629,6 +711,7 @@ def _enter_code(dlg, code, img):
     - 键入使用 win32api.keybd_event(底层 SendInput 等价), 比 pywinauto.keyboard 更可控."""
     import win32gui, win32con, win32api, win32process
     t_enter = _t.time()
+    _perf_mark("enter_start")
     edit = None
     btn = None
     try:
@@ -749,6 +832,7 @@ def _solve_captcha(max_attempts=6):
     solved = False
     for attempt in range(1, max_attempts + 1):
         _ta = _t.time()
+        _perf_mark(f"cap_attempt{attempt}_start")
         # 截图(带重试): 输错后 THS 刷新验证码的瞬间可能截到空白图, 重截即可; 空白图直接重截不 OCR.
         img = None
         _t_cap = _t.time()
@@ -763,6 +847,7 @@ def _solve_captcha(max_attempts=6):
                 pass
             time.sleep(0.25)
         _dt_cap = _t.time() - _t_cap
+        _perf_mark(f"cap{attempt}_cap")
         if img is None:
             print(f"[warn] 验证码尝试{attempt}: 截图失败, 重试")
             time.sleep(0.3)
@@ -770,6 +855,7 @@ def _solve_captcha(max_attempts=6):
         _t_ocr = _t.time()
         code, conf = _ocr_captcha(img)
         _dt_ocr = _t.time() - _t_ocr
+        _perf_mark(f"cap{attempt}_ocr")
         print(f"[info] 验证码 OCR 尝试{attempt}/{max_attempts}: code={code!r} conf={conf:.2f}")
         # 没拿到 4 位码 -> 视为截图问题, 重截重试(不放弃、不瞎填错误码)
         if not code or len(code) != 4:
@@ -784,6 +870,7 @@ def _solve_captcha(max_attempts=6):
             print("[warn] 验证码填入失败:", e)
             _save_capture(img, code, conf, False, f"尝试{attempt}: 填入异常 {e}")
         _dt_enter = _t.time() - _t_enter
+        _perf_mark(f"cap{attempt}_enter")
         # 轮询确认弹窗已关闭(最多 ~2.0s, 每 0.1s 探一次)
         # 不用 _dialog_still_open(dlg): 弹窗关闭瞬间 dlg.exists() 可能抛异常导致误判为仍开着.
         closed = False
@@ -794,6 +881,7 @@ def _solve_captcha(max_attempts=6):
                 closed = True
                 break
         _dt_wait = _t.time() - _t_wait
+        _perf_mark(f"cap{attempt}_wait")
         _save_capture(img, code, conf, closed, f"尝试{attempt}: {'已关闭' if closed else '仍开着(输错/未生效, 重截重试)'}")
         print(f"[perf] attempt{attempt}: 截图={_dt_cap:.3f}s OCR={_dt_ocr:.3f}s 填入={_dt_enter:.3f}s 等关闭={_dt_wait:.3f}s 合计={_t.time()-_ta:.3f}s closed={closed}")
         if closed:
@@ -906,6 +994,7 @@ def _solve_if_captcha():
     与下一次请求的 _captcha_open 前置解卡兜底, 故此处无需长轮询.
     无弹窗则快速返回(正常查询不增加端到端延迟, 满足无验证码 ≤1s)."""
     _t0 = _t.time()
+    _perf_mark("cap_detect_start")
     deadline = _t.time() + 0.9
     found = False
     while _t.time() < deadline:
@@ -914,8 +1003,10 @@ def _solve_if_captcha():
             break
         _t.sleep(0.1)
     if not found:
+        _perf_mark("cap_detect_miss")
         print(f"[perf] _solve_if_captcha: 无弹窗 检测耗时={_t.time()-_t0:.3f}s")
         return False
+    _perf_mark("cap_detect_hit")
     print(f"[perf] _solve_if_captcha: 命中弹窗 检测耗时={_t.time()-_t0:.3f}s 开始解卡")
     return _solve_captcha()
 
@@ -961,19 +1052,26 @@ def _patch_copy_get():
         if MOVE_WINDOWS:
             _ensure_xiadan_visible(getattr(self, "_main", None))
         _t0 = _t.time()
+        _perf_mark("copy_get_start")
         grid = self._get_grid(control_id)
+        _perf_mark("grid_ready")
         # ---- 快速路径: 复制一次, 成功即返回, 完全不查验证码(零开销, 满足无验证码≤1s) ----
         _clear_clipboard()                  # 清空: 复制失败即读到空, 杜绝返回上一接口历史数据(串台)
+        _perf_mark("clip_cleared")
         _robust_copy_keys(self, grid)       # 置前台+键盘焦点后发 ^A^C, 复制更稳
+        _perf_mark("copy_keys")
         content = self._safe_read_clip()
         if _clip_has(content):
             _clear_clipboard()
+            _perf_mark("copy_fast_ok")
             print(f"[perf] robust_get 快速路径返回 总耗时={_t.time()-_t0:.3f}s 分支=copy_ok")
             return self._format_grid_data(content)
+        _perf_mark("copy_miss")
         # ---- 复制落空: 要么是焦点偶发(无验证码), 要么是验证码打断了复制 ----
         _t_solve = _t.time()
         handled = _solve_if_captcha()       # 检测+解卡(含延迟弹窗短轮询); 弹窗打断复制,
         _dt_solve = _t.time() - _t_solve
+        _perf_mark("solve_if_done")
         if handled:                         # 解卡后同花顺自动把本次复制内容落盘 —— 只读不重复制
             content = self._safe_read_clip()
         if not _clip_has(content):
@@ -995,6 +1093,7 @@ def _patch_copy_get():
                                 break
                     _t.sleep(0.2)
         _clear_clipboard()
+        _perf_mark("copy_get_end")
         print(f"[perf] robust_get 总耗时={_t.time()-_t0:.3f}s 分支={'captcha' if handled else 'retry_copy'} 解卡耗时={_dt_solve:.3f}s handled={handled}")
         return self._format_grid_data(content)
 
@@ -1104,6 +1203,8 @@ def load_config():
         "exe_path": r"D:\同花顺软件\同花顺\同花顺\同花顺\xiadan.exe",
         "grid_strategy": "copy",  # "copy"(默认, 原生剪贴板, 验证码自动解卡) | "xls"(Ctrl+S 另存降频)
         "move_windows": False,  # 是否把同花顺主窗口/验证码弹窗移到主屏可见区(默认 False=不移动, 不打扰布局); 验证表明不移动也能正常复制/解卡
+        "perf_log": True,       # 耗时监控埋点日志(节点级 [perf]); 不开发时设 false 关闭
+        "verbose_log": True,    # 常规运行日志([info]/[warn]/[dbg] 等); 不开发时设 false 关闭, 降低 I/O 消耗
     }
     cfg = dict(defaults)
     try:
@@ -1127,6 +1228,15 @@ PORT = int(os.environ.get("EASYTRADER_PORT", CONFIG["port"]))
 EXE_PATH = os.environ.get("EASYTRADER_EXE_PATH", CONFIG["exe_path"])
 # 配置项: 是否移动窗口(默认 False=不移动). 环境变量 EASYTRADER_MOVE_WINDOWS=1/true/yes/on 可临时开启
 MOVE_WINDOWS = os.environ.get("EASYTRADER_MOVE_WINDOWS", str(CONFIG["move_windows"])).strip().lower() in ("1", "true", "yes", "on")
+# 配置项: 耗时监控 / 运行日志开关(默认开). 环境变量可临时覆盖; 不开发时设 false 关闭以降低消耗.
+PERF_LOG = os.environ.get("EASYTRADER_PERF_LOG", str(CONFIG["perf_log"])).strip().lower() in ("1", "true", "yes", "on")
+VERBOSE_LOG = os.environ.get("EASYTRADER_VERBOSE_LOG", str(CONFIG["verbose_log"])).strip().lower() in ("1", "true", "yes", "on")
+if not VERBOSE_LOG:
+    try:
+        import logging as _logging
+        _logging.getLogger("werkzeug").setLevel(_logging.WARNING)
+    except Exception:
+        pass
 HTML_FILE = os.path.join(
     os.path.dirname(os.path.abspath(__file__)),
     "easytrader_test.html",
